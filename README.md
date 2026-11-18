@@ -1,5 +1,5 @@
 # OunceCord
-Rudimentary Discord Client for Switch 2 (KaiHen) & Switch 1 (Atmosphere)
+Rudimentary Discord Client for Switch 2 (KaiHen)
 
 I recommend using an alt account as 3rd party clients are against ToS and im not responsible if your account is suspended. you have been warned.
 
