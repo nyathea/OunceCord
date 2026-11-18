@@ -13,7 +13,7 @@ I recommend using an alt account as 3rd party clients are against ToS and im not
 
 ## Building
 
-Install the Switch 2 devkit ([ounce-devkit](https://github.com/ouncebrew/ounce-devkit)), then:
+Install the Switch 2 devkit ([ounce-devkit](https://github.com/ouncebrew/ounce-devkit)), then run:
 
 ```sh
 make
