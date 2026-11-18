@@ -1,0 +1,8 @@
+/ai-refs
+.DS_Store
+/build/
+*.nro
+*.nacp
+*.elf
+*.map
+*.lst
