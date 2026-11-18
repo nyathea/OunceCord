@@ -1,10 +1,9 @@
 # OunceCord
-Rudimentary Discord Client for Switch 2 (KaiHen)
+Rudimentary Discord Client for Switch 2 (KaiHEN)
 
 I really recommend using an alt account as 3rd party clients are against ToS and im not responsible if your account is suspended.
 
-
-## Features (so far)
+## Current Features
 
 - Sign in with your account token (typed on the software keyboard, or read from the SD card)
 - Servers, channels, and DMs
@@ -49,4 +48,4 @@ the d-pad (or leave it for 5 seconds) to go back to button controls. While in mo
 that Joy-Con's shoulder buttons and stick only act as the mouse; the other Joy-Con works
 as usual.
 
-Thanks to [Paicord](https://github.com/llsc12/Paicord) which was used as a reference.
+Special Thanks to: [Paicord](https://github.com/llsc12/Paicord) which was used as a reference.
