@@ -5,9 +5,7 @@ I really recommend using an alt account as 3rd party clients are against ToS and
 
 ## Current Features
 
-- Sign in with your account token (typed on the software keyboard, or read from the SD card)
-- Servers, channels, and DMs
-- Live messages, edits, deletions and typing indicators
+- Log in with your email or phone number and password, with two-factor authentication
 - Sending messages
 
 ## Building
@@ -22,8 +20,14 @@ This produces `OunceCord.nro`. Copy it to `sdmc:/switch/` and launch it from hbm
 
 ## Signing in
 
-Either press **A** on the login screen and enter your token, or put it in
-`sdmc:/switch/OunceCord/token.txt`.
+Log in with your Discord email (or phone number) and password.
+
+If your account has two-factor authentication, choose an
+authenticator app code, a text message code or a backup code next.
+
+Logging in gives OunceCord a session of its own, so it never shares a token with
+another client. The session is kept in `token.txt` so you stay logged in;
+**-** twice logs out, which also ends the session on Discord's side.
 
 ## Controls
 

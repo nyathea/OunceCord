@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include "config.h"
 #include "discord/cdn.h"
@@ -126,6 +127,8 @@ void App::exit()
 
 void App::startClient()
 {
+    m_remote.stop();
+    m_remoteStarted = false;
     m_loginError.clear();
     m_screen = Screen::Main;
     m_pane = Pane::Guilds;
@@ -137,45 +140,293 @@ void App::startClient()
     m_client.start(m_token);
 }
 
-bool App::promptText(const char *header, const char *guide, std::string &out, bool token)
+bool App::promptText(const char *header, const char *guide, std::string &out, Kbd kind,
+                     int max_len)
 {
     SwkbdConfig kbd;
     if (R_FAILED(swkbdCreate(&kbd, 0)))
         return false;
-    swkbdConfigMakePresetDefault(&kbd);
+    if (kind == Kbd::Password)
+        swkbdConfigMakePresetPassword(&kbd);
+    else
+        swkbdConfigMakePresetDefault(&kbd);
     swkbdConfigSetHeaderText(&kbd, header);
     swkbdConfigSetGuideText(&kbd, guide);
     swkbdConfigSetInitialText(&kbd, out.c_str());
-    if (token) {
-        swkbdConfigSetType(&kbd, SwkbdType_QWERTY);
-        swkbdConfigSetStringLenMax(&kbd, 200);
-        swkbdConfigSetDicFlag(&kbd, 0);
-    } else {
-        swkbdConfigSetStringLenMax(&kbd, 2000);
+    switch (kind) {
+    case Kbd::Message:
+        swkbdConfigSetStringLenMax(&kbd, max_len ? max_len : 2000);
         swkbdConfigSetReturnButtonFlag(&kbd, 1);  // allow newlines
         swkbdConfigSetTextDrawType(&kbd, SwkbdTextDrawType_Box);
+        break;
+    case Kbd::Line:
+        swkbdConfigSetType(&kbd, SwkbdType_QWERTY);
+        swkbdConfigSetStringLenMax(&kbd, max_len ? max_len : 200);
+        swkbdConfigSetDicFlag(&kbd, 0);
+        break;
+    case Kbd::Password:
+        swkbdConfigSetStringLenMax(&kbd, max_len ? max_len : 128);
+        break;
+    case Kbd::Digits:
+        swkbdConfigSetType(&kbd, SwkbdType_NumPad);
+        swkbdConfigSetStringLenMax(&kbd, max_len ? max_len : 8);
+        break;
     }
     std::vector<char> buf(8192, 0);
     Result rc = swkbdShow(&kbd, buf.data(), buf.size());
     swkbdClose(&kbd);
-    if (R_FAILED(rc))
+    if (R_FAILED(rc)) {
+        memset(buf.data(), 0, buf.size());
         return false;
+    }
     out = buf.data();
+    memset(buf.data(), 0, buf.size());  // may hold a password
     return true;
 }
 
-void App::promptToken()
+// --- Login -------------------------------------------------------------------
+
+namespace {
+// QR-code login (discord/remoteauth). Off for now: Discord answers the
+// ticket exchange with a captcha, which we can't show. Worth trying again
+// once the client identity (identity.json) carries current build numbers.
+constexpr bool kQrLogin = false;
+
+constexpr float kLoginFormW = 480;  // left column; the QR panel takes the right
+constexpr float kLoginCardW = kQrLogin ? 920 : kLoginFormW + 96, kLoginCardH = 480;
+constexpr float kLoginRowH = 52, kLoginRowGap = 12;
+
+Rect loginCard()
 {
-    std::string token;
-    if (!promptText("Discord token", "Paste or type your account token", token, true))
+    return {Renderer::kWidth / 2 - kLoginCardW / 2, Renderer::kHeight / 2 - kLoginCardH / 2,
+            kLoginCardW, kLoginCardH};
+}
+
+// Keeps characters a code may contain; drops spaces and dashes.
+std::string cleanCode(const std::string &in)
+{
+    std::string out;
+    for (char c : in)
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+            out.push_back((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+    return out;
+}
+
+void wipe(std::string &s)
+{
+    s.assign(s.size(), '\0');
+    s.clear();
+}
+}  // namespace
+
+std::vector<App::LoginItem> App::loginItems() const
+{
+    std::vector<LoginItem> items;
+    bool busy = m_auth.busy();
+    if (m_loginStep == LoginStep::Credentials) {
+        LoginItem name{LoginAction::EditLogin, {}, "EMAIL OR PHONE NUMBER", m_loginName, true};
+        LoginItem pass{LoginAction::EditPassword, {}, "PASSWORD", std::string(m_loginPassword.size(), '*'), true};
+        LoginItem go{LoginAction::Submit, {}, busy ? "Logging in..." : "Log in", {}, false, true};
+        go.enabled = !busy && !m_loginName.empty() && !m_loginPassword.empty();
+        items = {name, pass, go};
+    } else {
+        if (m_mfaTotp)
+            items.push_back({LoginAction::Totp, {}, "Use a code from your authenticator app", {}, false, true});
+        if (m_mfaSms)
+            items.push_back({LoginAction::Sms, {}, m_smsSent ? "Enter the code we texted you" : "Text me a code", {},
+                             false, true});
+        if (m_mfaBackup)
+            items.push_back({LoginAction::Backup, {}, "Use a backup code", {}, false, true});
+        items.push_back({LoginAction::Back, {}, "Back", {}, false, false});
+        for (auto &it : items)
+            if (it.action != LoginAction::Back)
+                it.enabled = !busy;
+    }
+
+    Rect card = loginCard();
+    float y = card.y + 124;
+    for (auto &it : items) {
+        float h = it.field ? kLoginRowH + 20 : kLoginRowH - 6;
+        it.rect = {card.x + 48, y + (it.field ? 20 : 0), kLoginFormW, h - (it.field ? 20 : 0)};
+        y += h + kLoginRowGap;
+    }
+    return items;
+}
+
+void App::handleLoginInput(u64 down)
+{
+    auto items = loginItems();
+    int n = (int)items.size();
+    m_loginFocus = std::clamp(m_loginFocus, 0, n - 1);
+    if (down & (HidNpadButton_AnyUp | HidNpadButton_AnyDown)) {
+        int dir = (down & HidNpadButton_AnyUp) ? -1 : 1;
+        m_loginFocus = std::clamp(m_loginFocus + dir, 0, n - 1);
+    }
+    if (kQrLogin && (down & HidNpadButton_Y))
+        m_remote.refresh();
+    if (down & HidNpadButton_A)
+        loginActivate(items[m_loginFocus].action);
+    else if ((down & HidNpadButton_B) && m_loginStep == LoginStep::Mfa)
+        loginActivate(LoginAction::Back);
+}
+
+void App::loginActivate(LoginAction action)
+{
+    if (m_auth.busy() && action != LoginAction::Back)
         return;
-    token = config::normalizeToken(token);
-    if (token.empty())
+    switch (action) {
+    case LoginAction::EditLogin:
+        if (promptText("Email or phone number", "The email or phone number of your Discord account",
+                       m_loginName, Kbd::Line, 320)) {
+            while (!m_loginName.empty() && m_loginName.back() == ' ')
+                m_loginName.pop_back();
+            while (!m_loginName.empty() && m_loginName.front() == ' ')
+                m_loginName.erase(0, 1);
+            if (!m_loginName.empty())
+                m_loginFocus = m_loginPassword.empty() ? 1 : 2;
+        }
+        break;
+    case LoginAction::EditPassword: {
+        std::string pw = m_loginPassword;
+        if (promptText("Password", "Your Discord password", pw, Kbd::Password)) {
+            wipe(m_loginPassword);
+            m_loginPassword = std::move(pw);
+            if (!m_loginPassword.empty())
+                m_loginFocus = m_loginName.empty() ? 0 : 2;
+        }
+        wipe(pw);
+        break;
+    }
+    case LoginAction::Submit:
+        submitLogin();
+        break;
+    case LoginAction::Totp: {
+        std::string code;
+        if (promptText("Authenticator code", "The 6-digit code from your authenticator app", code, Kbd::Digits, 6)) {
+            code = cleanCode(code);
+            if (!code.empty()) {
+                m_loginError.clear();
+                m_loginInfo = "Checking the code...";
+                m_auth.submitMfa("totp", code, [this](const discord::AuthResult &r) { onAuthResult(r); });
+            }
+        }
+        break;
+    }
+    case LoginAction::Sms:
+        if (!m_smsSent) {
+            m_loginError.clear();
+            m_loginInfo = "Sending a text message...";
+            m_auth.sendSms([this](const discord::AuthResult &r) { onAuthResult(r); });
+        } else {
+            std::string code;
+            if (promptText("Text message code", "The 6-digit code we texted you", code, Kbd::Digits, 6)) {
+                code = cleanCode(code);
+                if (!code.empty()) {
+                    m_loginError.clear();
+                    m_loginInfo = "Checking the code...";
+                    m_auth.submitMfa("sms", code, [this](const discord::AuthResult &r) { onAuthResult(r); });
+                }
+            }
+        }
+        break;
+    case LoginAction::Backup: {
+        std::string code;
+        if (promptText("Backup code", "One of your 8-character backup codes", code, Kbd::Line, 16)) {
+            code = cleanCode(code);
+            if (!code.empty()) {
+                m_loginError.clear();
+                m_loginInfo = "Checking the code...";
+                m_auth.submitMfa("backup", code, [this](const discord::AuthResult &r) { onAuthResult(r); });
+            }
+        }
+        break;
+    }
+    case LoginAction::Back:
+        m_auth.reset();
+        m_loginStep = LoginStep::Credentials;
+        m_loginFocus = 1;
+        m_loginError.clear();
+        m_loginInfo.clear();
+        m_smsSent = false;
+        break;
+    }
+}
+
+void App::submitLogin()
+{
+    if (m_auth.busy() || m_loginName.empty() || m_loginPassword.empty())
         return;
+    m_loginError.clear();
+    m_loginInfo.clear();
+    m_auth.login(m_loginName, m_loginPassword, [this](const discord::AuthResult &r) { onAuthResult(r); });
+}
+
+void App::onAuthResult(const discord::AuthResult &r)
+{
+    using Kind = discord::AuthResult::Kind;
+    m_loginInfo.clear();
+    switch (r.kind) {
+    case Kind::Token:
+        finishLogin(r.token);
+        break;
+    case Kind::Mfa:
+        // The password is no longer needed.
+        wipe(m_loginPassword);
+        m_loginStep = LoginStep::Mfa;
+        m_loginFocus = 0;
+        m_loginError.clear();
+        m_mfaTotp = r.mfa_totp;
+        m_mfaSms = r.mfa_sms;
+        m_mfaBackup = r.mfa_backup;
+        m_mfaWebauthn = r.mfa_webauthn;
+        m_smsSent = false;
+        if (!m_mfaTotp && !m_mfaSms && !m_mfaBackup)
+            m_loginError = "This account only allows security keys, which OunceCord can't use.";
+        break;
+    case Kind::SmsSent:
+        m_smsSent = true;
+        m_loginInfo = r.phone.empty() ? "Code sent." : "Code sent to " + r.phone + ".";
+        break;
+    case Kind::Captcha:
+        m_loginError = "Discord asked for a captcha, which can't be shown here. "
+                       "Try again later, or check your email for a login alert.";
+        break;
+    case Kind::Error:
+        m_loginError = r.message;
+        if (r.ticket_expired && m_loginStep == LoginStep::Mfa) {
+            m_loginStep = LoginStep::Credentials;
+            m_loginFocus = 1;
+            m_smsSent = false;
+        }
+        break;
+    }
+}
+
+void App::finishLogin(const std::string &token)
+{
+    wipe(m_loginPassword);
+    m_loginStep = LoginStep::Credentials;
+    m_loginFocus = 0;
+    m_loginError.clear();
+    m_loginInfo.clear();
+    m_smsSent = false;
     m_token = token;
     if (!config::saveToken(token))
-        logf("app: could not save token");
+        logf("app: could not save the session token");
+    logf("app: logged in");
     startClient();
+}
+
+void App::logOut(const std::string &message)
+{
+    m_client.stop();
+    config::clearToken();
+    m_token.clear();
+    m_screen = Screen::Login;
+    m_loginStep = LoginStep::Credentials;
+    m_loginFocus = m_loginName.empty() ? 0 : 1;
+    m_loginError = message;
+    m_loginInfo.clear();
 }
 
 void App::composeMessage()
@@ -188,7 +439,7 @@ void App::composeMessage()
         return;
     std::string text;
     std::string header = "Message " + ch->label();
-    if (!promptText(header.c_str(), "Type a message", text, false))
+    if (!promptText(header.c_str(), "Type a message", text, Kbd::Message))
         return;
     // Trim trailing whitespace; skip empty messages.
     while (!text.empty() && (text.back() == ' ' || text.back() == '\n'))
@@ -368,13 +619,6 @@ int App::hitChannelRow(float x, float y) const
     return index;
 }
 
-Rect App::loginButtonRect() const
-{
-    const float W = Renderer::kWidth, H = Renderer::kHeight;
-    Rect card{W / 2 - 300, H / 2 - 190, 600, 380};
-    return {card.x + 60, card.y + 34 + 54 + 48, card.w - 120, 48};
-}
-
 Rect App::jumpPillRect() const
 {
     float x = kGuildBarW + kChannelW, w = Renderer::kWidth - x;
@@ -390,8 +634,19 @@ bool App::hovering(Rect r) const
 void App::tapAt(float x, float y)
 {
     if (m_screen == Screen::Login) {
-        if (loginButtonRect().contains(x, y))
-            promptToken();
+        if (kQrLogin && qrPanelRect().contains(x, y)) {
+            m_remote.refresh();
+            return;
+        }
+        auto items = loginItems();
+        for (size_t i = 0; i < items.size(); i++) {
+            if (items[i].rect.contains(x, y)) {
+                m_loginFocus = (int)i;
+                if (items[i].enabled || items[i].field)
+                    loginActivate(items[i].action);
+                break;
+            }
+        }
         return;
     }
     if (x < kGuildBarW) {
@@ -594,33 +849,21 @@ void App::handleInput()
     handleTouch();
 
     if (m_screen == Screen::Login) {
-        if (down & HidNpadButton_A)
-            promptToken();
-        if (down & HidNpadButton_Y) {
-            m_token = config::loadToken();
-            if (!m_token.empty())
-                startClient();
-            else
-                m_loginError = std::string("No token found at ") + config::kTokenPath;
-        }
+        handleLoginInput(down);
         return;
     }
 
-    // Auth failure sends us back to the login screen.
+    // A rejected session sends us back to the login screen.
     if (m_client.status() == discord::GatewayStatus::AuthFailed) {
-        m_client.stop();
-        m_loginError = "Discord rejected that token. Enter a new one.";
-        m_screen = Screen::Login;
+        logOut("Your session has ended. Log in again.");
         return;
     }
 
     if (down & HidNpadButton_Minus) {
         if (m_frameTime < m_logoutArmedUntil) {
-            m_client.stop();
-            config::clearToken();
-            m_token.clear();
-            m_screen = Screen::Login;
-            m_loginError = "Logged out. The saved token was removed.";
+            // Ends the session on Discord's side too, so the token is useless.
+            m_auth.logout(m_token);
+            logOut("Logged out.");
             return;
         }
         m_logoutArmedUntil = m_frameTime + 3000;
@@ -688,6 +931,18 @@ bool App::frame()
 {
     m_frameTime = nowMs();
     m_client.update();
+    m_auth.update();
+    if (kQrLogin && m_screen == Screen::Login) {
+        if (!m_remoteStarted) {
+            m_remote.start();
+            m_remoteStarted = true;
+        }
+        std::string token;
+        if (m_remote.takeToken(token)) {
+            logf("app: logged in with a QR code");
+            finishLogin(token);
+        }
+    }
     m_images.update();
     handleInput();
     if (m_quit)
@@ -707,39 +962,159 @@ void App::drawLogin()
 {
     const float W = Renderer::kWidth, H = Renderer::kHeight;
     m_r.fillRect({0, 0, W, H}, col::bg_guilds);
-    Rect card{W / 2 - 300, H / 2 - 190, 600, 380};
+    Rect card = loginCard();
     m_r.fillRoundRect(card, 10, col::bg_channels);
 
-    float y = card.y + 34;
-    const char *title = "OunceCord";
-    m_r.drawText(W / 2 - m_r.measureText(title, 34) / 2, y, title, 34, col::bright);
-    y += 54;
-    const char *sub = "Sign in with your Discord token";
-    m_r.drawText(W / 2 - m_r.measureText(sub, kTextSize) / 2, y, sub, kTextSize, col::muted);
-    y += 48;
+    const float formCx = card.x + 48 + kLoginFormW / 2;
+    float y = card.y + 30;
+    const char *title = m_loginStep == LoginStep::Mfa ? "Two-factor authentication" : "Welcome back!";
+    m_r.drawText(formCx - m_r.measureText(title, 28) / 2, y, title, 28, col::bright);
+    y += 46;
+    const char *sub = m_loginStep == LoginStep::Mfa ? "Confirm it's you to finish logging in."
+                                                    : "Log in to Discord with OunceCord.";
+    m_r.drawText(formCx - m_r.measureText(sub, kTextSize) / 2, y, sub, kTextSize, col::muted);
+    if (kQrLogin)
+        drawQrPanel(qrPanelRect());
 
-    Rect btn = loginButtonRect();
-    m_r.fillRoundRect(btn, 6, hovering(btn) ? col::accent_hover : col::accent);
-    const char *label = "(A)  Enter token";
-    m_r.drawText(W / 2 - m_r.measureText(label, 18) / 2, btn.y + 13, label, 18, col::bright);
-    y += 66;
-
-    std::string file_line = std::string("(Y)  Load from ") + config::kTokenPath;
-    m_r.drawText(W / 2 - m_r.measureText(file_line, kSmallSize) / 2, y, file_line, kSmallSize, col::text);
-    y += 40;
-
-    if (!m_loginError.empty()) {
-        m_r.drawText(W / 2 - m_r.measureText(m_loginError, kSmallSize) / 2, y, m_loginError,
-                     kSmallSize, col::danger);
+    auto items = loginItems();
+    m_loginFocus = std::clamp(m_loginFocus, 0, (int)items.size() - 1);
+    float bottom = y;
+    for (size_t i = 0; i < items.size(); i++) {
+        const LoginItem &it = items[i];
+        bool focused = (int)i == m_loginFocus && !m_mouseMode;
+        bool hover = hovering(it.rect);
+        Rect r = it.rect;
+        if (it.field) {
+            m_r.drawText(r.x, r.y - 20, it.label, 12, col::muted);
+            if (focused)
+                m_r.fillRoundRect({r.x - 2, r.y - 2, r.w + 4, r.h + 4}, 6, col::accent);
+            m_r.fillRoundRect(r, 4, hover ? col::hover : col::bg_guilds);
+            std::string value = it.value.empty() ? "Press (A) to type" : it.value;
+            value = m_r.ellipsize(value, kTextSize, r.w - 28);
+            m_r.drawText(r.x + 14, r.y + r.h / 2 - 11, value, kTextSize, it.value.empty() ? col::faint : col::text);
+        } else {
+            Color bg = it.primary ? (hover || focused ? col::accent_hover : col::accent)
+                                  : (hover || focused ? col::selected : col::bg_input);
+            if (!it.enabled)
+                bg = Color(bg.r, bg.g, bg.b, 110);
+            if (focused && it.primary)
+                m_r.fillRoundRect({r.x - 2, r.y - 2, r.w + 4, r.h + 4}, 6, col::bright);
+            m_r.fillRoundRect(r, 4, bg);
+            m_r.drawText(r.x + r.w / 2 - m_r.measureText(it.label, 17) / 2, r.y + r.h / 2 - 11, it.label, 17,
+                         it.enabled ? col::bright : col::muted);
+        }
+        bottom = r.y + r.h;
     }
+
+    // Status line(s) under the form.
+    y = bottom + 16;
+    const std::string &msg = !m_loginError.empty() ? m_loginError : m_loginInfo;
+    if (!msg.empty()) {
+        Color c = !m_loginError.empty() ? col::danger : col::muted;
+        for (const auto &line : m_r.wrapText(msg, kSmallSize, kLoginFormW)) {
+            m_r.drawText(formCx - m_r.measureText(line, kSmallSize) / 2, y, line, kSmallSize, c);
+            y += 19;
+        }
+    }
+
     y = card.y + card.h - 44;
     const char *warn1 = "Third-party clients break Discord's Terms of Service.";
-    const char *warn2 = "Your account could be banned. The token is saved on the SD card.";
+    const char *warn2 = "Your account could be banned. Your session is saved on the SD card.";
     m_r.drawText(W / 2 - m_r.measureText(warn1, 13) / 2, y, warn1, 13, col::faint);
     m_r.drawText(W / 2 - m_r.measureText(warn2, 13) / 2, y + 18, warn2, 13, col::faint);
 
-    const char *hint = "(+) Exit";
+    discord::RemoteAuth::Phase qp = m_remote.snapshot().phase;
+    bool stale = qp == discord::RemoteAuth::Phase::Expired || qp == discord::RemoteAuth::Phase::Failed;
+    std::string hint = m_mouseMode ? "Click to select    (+) Exit"
+                       : m_loginStep == LoginStep::Mfa ? "(A) Select    (B) Back    (+) Exit"
+                                                       : "(A) Select    (+) Exit";
+    if (kQrLogin && stale && !m_mouseMode)
+        hint = "(Y) New QR code    " + hint;
     m_r.drawText(W - 24 - m_r.measureText(hint, kSmallSize), H - 32, hint, kSmallSize, col::muted);
+}
+
+Rect App::qrPanelRect() const
+{
+    Rect card = loginCard();
+    float x = card.x + 48 + kLoginFormW + 40;
+    return {x, card.y + 30, card.x + card.w - 40 - x, 340};
+}
+
+void App::drawQrPanel(Rect area)
+{
+    using Phase = discord::RemoteAuth::Phase;
+    discord::RemoteAuth::Snapshot snap = m_remote.snapshot();
+    const float cx = area.x + area.w / 2;
+    const float box = 220;
+    Rect qr_box{cx - box / 2, area.y + 6, box, box};
+    float text_y = qr_box.y + box + 22;
+
+    auto centered = [&](const std::string &text, float size, Color c) {
+        for (const auto &line : m_r.wrapText(text, size, area.w)) {
+            m_r.drawText(cx - m_r.measureText(line, size) / 2, text_y, line, size, c);
+            text_y += size + 6;
+        }
+    };
+
+    if (snap.phase == Phase::Scanned || snap.phase == Phase::LoggingIn) {
+        m_r.fillRoundRect(qr_box, 8, col::bg_guilds);
+        const User &u = snap.user;
+        std::string name = u.displayName().empty() ? std::string("your account") : u.displayName();
+        drawAvatar(cx, qr_box.y + box / 2 - 20, 44, name, u.id, u.id ? discord::cdn::avatarPath(u, 128) : std::string());
+        std::string who = m_r.ellipsize(name, kTextSize, box - 20);
+        m_r.drawText(cx - m_r.measureText(who, kTextSize) / 2, qr_box.y + box / 2 + 38, who, kTextSize, col::bright);
+        centered("Check your phone!", 22, col::bright);
+        centered(snap.phase == Phase::LoggingIn ? "Logging in..." : "Confirm the login in the Discord app.",
+                 kSmallSize, col::muted);
+        return;
+    }
+
+    bool ready = snap.phase == Phase::WaitingScan && !snap.url.empty();
+    if (ready && snap.url_version != m_qrVersion) {
+        m_qr = qr::encode(snap.url);
+        m_qrVersion = snap.url_version;
+    }
+    if (ready && m_qr.size > 0) {
+        // White background with a quiet zone of four modules.
+        m_r.fillRoundRect(qr_box, 8, Color(255, 255, 255));
+        float module = std::floor((box - 16) / (m_qr.size + 8));
+        float side = module * m_qr.size;
+        float ox = std::floor(cx - side / 2), oy = std::floor(qr_box.y + box / 2 - side / 2);
+        for (int y = 0; y < m_qr.size; y++) {
+            // Merge horizontal runs into one rectangle each.
+            int x = 0;
+            while (x < m_qr.size) {
+                if (!m_qr.at(x, y)) {
+                    x++;
+                    continue;
+                }
+                int start = x;
+                while (x < m_qr.size && m_qr.at(x, y))
+                    x++;
+                m_r.fillRect({ox + start * module, oy + y * module, (x - start) * module, module}, Color(0, 0, 0));
+            }
+        }
+        centered("Log in with QR code", 22, col::bright);
+        centered("Scan this with the Discord mobile app to log in instantly.", kSmallSize, col::muted);
+        return;
+    }
+
+    m_r.fillRoundRect(qr_box, 8, hovering(qr_box) ? col::hover : col::bg_guilds);
+    std::string inside;
+    if (snap.phase == Phase::Expired)
+        inside = "QR code expired";
+    else if (snap.phase == Phase::Failed)
+        inside = "QR login unavailable";
+    else
+        inside = "Making a QR code...";
+    m_r.drawText(cx - m_r.measureText(inside, kTextSize) / 2, qr_box.y + box / 2 - 10, inside, kTextSize, col::muted);
+    centered("Log in with QR code", 22, col::bright);
+    if (snap.phase == Phase::Expired)
+        centered(m_mouseMode ? "Click the box for a new code." : "Press (Y) for a new code.", kSmallSize, col::muted);
+    else if (snap.phase == Phase::Failed)
+        centered(snap.message + (m_mouseMode ? ". Click to retry." : ". Press (Y) to retry."), kSmallSize, col::muted);
+    else
+        centered("Scan it with the Discord mobile app to log in instantly.", kSmallSize, col::muted);
 }
 
 void App::drawMain()

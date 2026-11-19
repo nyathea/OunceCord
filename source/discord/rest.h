@@ -22,23 +22,37 @@ constexpr const char *kApiBase = "/api/v9";
 constexpr const char *kGatewayHost = "gateway.discord.gg";
 
 // Client identity. OunceCord presents itself like the official desktop
-// client (as Paicord does), since user tokens are expected to come from one.
-// Edit these in one place when Discord's build numbers move on.
+// client (as Paicord does). The version fields default to Paicord's macOS
+// profile; when Discord's builds move on they can be updated without a
+// rebuild through sdmc:/switch/OunceCord/identity.json, e.g.
+//   {"client_version": "0.0.398", "client_build_number": 575562}
+// Keep them consistent with each other, and don't run another client with
+// different properties on the same session.
 struct Identity {
+    std::string client_version = "0.0.398";
+    std::string electron_version = "37.6.0";
+    std::string chrome_version = "138.0.7204.251";
+    std::string os_version = "24.5.0";
+    int64_t client_build_number = 575562;
+    int64_t native_build_number = 85861;
+
     std::string locale;    // "en-US"
     std::string timezone;  // "Europe/London"
     std::string launch_id, launch_signature, heartbeat_session_id;
 
     static Identity &get();
-    void init();  // Reads locale and time zone from the system.
+    // Reads locale and time zone from the system, and identity.json.
+    void init();
 
     std::string userAgent() const;
     // The connection properties object, for IDENTIFY (ws=true) and for the
     // X-Super-Properties header (ws=false).
     json::Value properties(bool ws) const;
     std::string superPropertiesHeader() const;
-    // Headers every authenticated REST request carries.
-    HttpHeaders restHeaders(const std::string &token) const;
+    // Headers every REST request carries. An empty token leaves out
+    // Authorization (for the login endpoints).
+    HttpHeaders restHeaders(const std::string &token,
+                            const char *referer = "https://discord.com/channels/@me") const;
 };
 
 using MainThreadPost = std::function<void(std::function<void()>)>;

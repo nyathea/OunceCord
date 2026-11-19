@@ -51,6 +51,34 @@ bool saveToken(const std::string &token)
     return ok;
 }
 
+bool readText(const char *path, std::string &out, size_t max_size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    bool ok = size >= 0 && (size_t)size <= max_size;
+    if (ok) {
+        out.resize(size);
+        ok = fread(out.data(), 1, size, f) == (size_t)size;
+    }
+    fclose(f);
+    return ok;
+}
+
+bool writeText(const char *path, const std::string &data)
+{
+    ensureDir();
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    fclose(f);
+    return ok;
+}
+
 void clearToken()
 {
     remove(kTokenPath);

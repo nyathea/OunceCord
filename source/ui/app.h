@@ -9,9 +9,12 @@
 
 #include <switch.h>
 
+#include "discord/auth.h"
 #include "discord/client.h"
+#include "discord/remoteauth.h"
 #include "ui/images.h"
 #include "ui/render.h"
+#include "util/qr.h"
 
 class App {
 public:
@@ -23,6 +26,19 @@ public:
 private:
     enum class Screen { Login, Main };
     enum class Pane { Guilds, Channels, Messages };
+    enum class LoginStep { Credentials, Mfa };
+    enum class LoginAction { EditLogin, EditPassword, Submit, Totp, Sms, Backup, Back };
+    enum class Kbd { Message, Line, Password, Digits };
+
+    struct LoginItem {
+        LoginAction action;
+        Rect rect;
+        std::string label;  // field caption, or button text
+        std::string value;  // field contents (masked for the password)
+        bool field = false;
+        bool primary = false;
+        bool enabled = true;
+    };
 
     struct ChannelRow {
         Snowflake id = 0;
@@ -48,11 +64,23 @@ private:
     Renderer m_r;
     ImageCache m_images;
     discord::Client m_client;
+    discord::Auth m_auth;
+    discord::RemoteAuth m_remote;
+    bool m_remoteStarted = false;
+    qr::Code m_qr;
+    uint32_t m_qrVersion = 0;
     PadState m_pad{};
     Screen m_screen = Screen::Login;
     Pane m_pane = Pane::Guilds;
     std::string m_token;
-    std::string m_loginError;
+
+    // Login screen.
+    LoginStep m_loginStep = LoginStep::Credentials;
+    std::string m_loginName, m_loginPassword;
+    int m_loginFocus = 0;
+    std::string m_loginError, m_loginInfo;
+    bool m_mfaTotp = false, m_mfaSms = false, m_mfaBackup = false, m_mfaWebauthn = false;
+    bool m_smsSent = false;
     bool m_quit = false;
     uint64_t m_frameTime = 0;
 
@@ -96,8 +124,15 @@ private:
     uint64_t m_logoutArmedUntil = 0;
 
     void startClient();
-    void promptToken();
-    bool promptText(const char *header, const char *guide, std::string &out, bool token);
+    bool promptText(const char *header, const char *guide, std::string &out, Kbd kind,
+                    int max_len = 0);
+    std::vector<LoginItem> loginItems() const;
+    void handleLoginInput(u64 down);
+    void loginActivate(LoginAction action);
+    void submitLogin();
+    void onAuthResult(const discord::AuthResult &r);
+    void finishLogin(const std::string &token);
+    void logOut(const std::string &message);
     void composeMessage();
 
     void handleInput();
@@ -111,7 +146,6 @@ private:
     void wheelScroll(float x, float y, float amount);
     int hitGuild(float x, float y) const;       // guild bar index, or -1
     int hitChannelRow(float x, float y) const;  // row index, or -1
-    Rect loginButtonRect() const;
     Rect jumpPillRect() const;
     bool hovering(Rect r) const;
     void drawCursor();
@@ -125,6 +159,8 @@ private:
     void rebuildLayout(float width);
 
     void drawLogin();
+    void drawQrPanel(Rect area);
+    Rect qrPanelRect() const;
     void drawMain();
     void drawGuildBar(Rect area);
     void drawChannelList(Rect area);
