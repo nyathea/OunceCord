@@ -28,6 +28,12 @@ inline uint64_t snowflakeUnixMs(uint64_t id) { return (id >> 22) + 1420070400000
 // Formats a unix timestamp (seconds) in the console's time zone,
 // as "HH:MM" today or "YYYY-MM-DD HH:MM" otherwise.
 std::string formatTime(uint64_t unix_seconds);
+// Wall-clock time in the console's time zone.
+struct LocalTime {
+    int year, month, day, hour, minute, second, weekday;  // month 1-12, weekday 0 = Sunday
+};
+bool localTime(int64_t unix_seconds, LocalTime &out);
+int64_t unixNow();
 
 // Percent-encodes a string for use in a URL query.
 std::string urlEncode(std::string_view s);

@@ -1,0 +1,8 @@
+[79154.663] OunceCord starting
+[79154.669] identity: client 0.0.398 build 575562 native 85861, Electron 37.6.0
+[79154.723] render: zink Vulkan 1.4(Switch 2 GPU (NVK model 0x808) (MESA_NVK)), surface 1280x720
+[79154.949] gateway: sent identify
+[79155.987] gateway: READY (4521542 bytes)
+[79156.004] client: ready as nyathea, 44 guilds, 105 DMs
+[79166.412] app: no GIF at https://static.klipy.com/ii/d7aec6f6f171607374b2065c836f92f4/27/3f/rBYzLcoH3ZueStOxQbz3.gif, showing the still
+[79175.093] OunceCord exiting

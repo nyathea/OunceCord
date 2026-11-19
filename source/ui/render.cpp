@@ -42,6 +42,7 @@ static const char *const kFragmentSource =
 // from the fragment's position relative to the target rectangle:
 //   circle:   |p| = 1
 //   squircle: |x|^5 + |y|^5 = 1 (a superellipse)
+//   rounded:  a rectangle with corners of radius u_radius (in pixels)
 // The distance is converted to pixels so the edge is one pixel wide.
 // Uniforms shared with the vertex shader must match its precision (highp),
 // or the program fails to link.
@@ -52,21 +53,29 @@ static const char *const kImageFragmentSource =
     "in vec4 v_color;\n"
     "uniform sampler2D u_image;\n"
     "uniform vec4 u_rect;\n"   // x, y, w, h in window pixels (top-left origin)
-    "uniform int u_shape;\n"   // 0 circle, 1 squircle
+    "uniform int u_shape;\n"   // 0 circle, 1 squircle, 2 rounded rectangle
+    "uniform float u_radius;\n"
     "uniform vec2 u_screen;\n"
     "out vec4 o_color;\n"
     "void main() {\n"
     "    vec2 half_size = u_rect.zw * 0.5;\n"
     "    vec2 frag = vec2(gl_FragCoord.x, u_screen.y - gl_FragCoord.y);\n"
     "    vec2 p = abs(frag - (u_rect.xy + half_size)) / half_size;\n"
-    "    float d;\n"
-    "    if (u_shape == 0) {\n"
-    "        d = length(p) - 1.0;\n"
+    "    float mask;\n"
+    "    if (u_shape == 2) {\n"
+    "        vec2 q = abs(frag - (u_rect.xy + half_size)) - half_size + vec2(u_radius);\n"
+    "        float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - u_radius;\n"
+    "        mask = clamp(0.5 - dist, 0.0, 1.0);\n"
     "    } else {\n"
-    "        vec2 q = p * p;\n"
-    "        d = pow(q.x * q.x * p.x + q.y * q.y * p.y, 0.2) - 1.0;\n"
+    "        float d;\n"
+    "        if (u_shape == 0) {\n"
+    "            d = length(p) - 1.0;\n"
+    "        } else {\n"
+    "            vec2 q = p * p;\n"
+    "            d = pow(q.x * q.x * p.x + q.y * q.y * p.y, 0.2) - 1.0;\n"
+    "        }\n"
+    "        mask = clamp(0.5 - d * min(half_size.x, half_size.y), 0.0, 1.0);\n"
     "    }\n"
-    "    float mask = clamp(0.5 - d * min(half_size.x, half_size.y), 0.0, 1.0);\n"
     "    vec4 c = texture(u_image, v_uv) * v_color;\n"
     "    o_color = vec4(c.rgb, c.a * mask);\n"
     "}\n";
@@ -152,6 +161,7 @@ bool Renderer::init()
     m_uImgScreen = glGetUniformLocation(m_imageProgram, "u_screen");
     m_uImgRect = glGetUniformLocation(m_imageProgram, "u_rect");
     m_uImgShape = glGetUniformLocation(m_imageProgram, "u_shape");
+    m_uImgRadius = glGetUniformLocation(m_imageProgram, "u_radius");
 
     // 1x1 white texture, for filling shapes with the image program.
     const uint8_t white[4] = {255, 255, 255, 255};
@@ -293,6 +303,14 @@ const Renderer::Glyph *Renderer::glyph(uint32_t cp, int px)
     auto it = m_glyphs.find(key);
     if (it != m_glyphs.end())
         return &it->second;
+    if (cp >= kInlineFirst && cp <= kInlineLast) {
+        Glyph g{0, 0, 0, 0, 0, 0, 0, 0, roundf(px * kInlineAdvance)};
+        return &m_glyphs.emplace(key, g).first->second;
+    }
+    if (cp >= kMarkFirst && cp <= kMarkLast) {
+        Glyph g{0, 0, 0, 0, 0, 0, 0, 0, 0};
+        return &m_glyphs.emplace(key, g).first->second;
+    }
 
     FT_Face face = nullptr;
     FT_UInt index = 0;
@@ -589,7 +607,8 @@ void Renderer::drawImage(GLuint tex, Rect r, Shape shape, Color tint)
     glUseProgram(m_imageProgram);
     glUniform2f(m_uImgScreen, (float)m_surfaceW, (float)m_surfaceH);
     glUniform4f(m_uImgRect, r.x * s, r.y * s, r.w * s, r.h * s);
-    glUniform1i(m_uImgShape, shape == Shape::Circle ? 0 : 1);
+    glUniform1i(m_uImgShape, shape == Shape::Circle ? 0 : shape == Shape::Squircle ? 1 : 2);
+    glUniform1f(m_uImgRadius, shape == Shape::Rect ? 0.0f : 6.0f * s);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     glBindVertexArray(m_vao);

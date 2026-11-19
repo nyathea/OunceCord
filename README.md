@@ -7,6 +7,10 @@ I really recommend using an alt account as 3rd party clients are against ToS and
 
 - Log in with your email or phone number and password, with two-factor authentication
 - Sending messages
+- Images in chat (attachments and link previews) with a full-screen viewer
+- Custom emotes, animated ones included (large when a message is only emotes, like Discord)
+- Mentions shown as names (users, roles, channels, @everyone) plus timestamps, with messages that mention you highlighted
+- Animated GIFs, including Tenor and Giphy GIFs (fetched directly from Tenor/Giphy, since Discord only proxies those as video). Klipy GIFs show as a still for now
 
 ## Building
 
@@ -34,7 +38,7 @@ another client. The session is kept in `token.txt` so you stay logged in;
 | Button | Action |
 | --- | --- |
 | D-pad / left stick | Move selection, scroll messages |
-| A | Open server / channel |
+| A | Open server / channel; in messages, view the newest image on screen |
 | B | Back |
 | L / R | Previous / next server |
 | X | Write a message |
@@ -44,7 +48,7 @@ another client. The session is kept in `token.txt` so you stay logged in;
 | - (twice) | Log out |
 | + | Exit |
 
-Touch: tap servers and channels, drag to scroll, tap the message bar to write.
+Touch: tap servers and channels, drag to scroll, tap the message bar to write, tap an image to view it (or reveal a spoiler). In the viewer, left/right (or L/R) go to the previous/next image and B closes it.
 
 Mouse mode: put a Joy-Con 2 on its side on a surface and slide it. A cursor
 appears; click with its L/ZL or R/ZR, hold and drag or use its stick to scroll, and press

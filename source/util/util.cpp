@@ -137,6 +137,30 @@ std::string formatTime(uint64_t unix_seconds)
     return buf;
 }
 
+bool localTime(int64_t unix_seconds, LocalTime &out)
+{
+    TimeCalendarTime ct{};
+    TimeCalendarAdditionalInfo info{};
+    if (R_SUCCEEDED(timeToCalendarTimeWithMyRule((u64)unix_seconds, &ct, &info))) {
+        out = {ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, (int)info.wday};
+        return true;
+    }
+    time_t t = (time_t)unix_seconds;
+    struct tm *tm = gmtime(&t);
+    if (!tm)
+        return false;
+    out = {tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, tm->tm_wday};
+    return true;
+}
+
+int64_t unixNow()
+{
+    u64 now = 0;
+    if (R_SUCCEEDED(timeGetCurrentTime(TimeType_Default, &now)))
+        return (int64_t)now;
+    return (int64_t)time(nullptr);
+}
+
 std::string urlEncode(std::string_view s)
 {
     static const char hex[] = "0123456789ABCDEF";

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "discord/types.h"
 
+#include <cctype>
+
 #include <algorithm>
 
 User User::fromJson(const json::Value &v)
@@ -230,6 +232,34 @@ void Guild::sortChannels()
     });
 }
 
+namespace {
+
+void parseMentions(const json::Value &arr, std::vector<std::pair<Snowflake, std::string>> &names,
+                   std::vector<Snowflake> *ids)
+{
+    for (const auto &u : arr.items()) {
+        Snowflake id = u["id"].asId();
+        if (!id)
+            continue;
+        std::string name = u["member"]["nick"].str();
+        if (name.empty())
+            name = User::fromJson(u).displayName();
+        names.emplace_back(id, std::move(name));
+        if (ids)
+            ids->push_back(id);
+    }
+}
+
+}  // namespace
+
+const std::string *Message::mentionName(Snowflake id) const
+{
+    for (const auto &[uid, name] : mention_names)
+        if (uid == id)
+            return &name;
+    return nullptr;
+}
+
 Message Message::fromJson(const json::Value &v)
 {
     Message m;
@@ -240,23 +270,60 @@ Message Message::fromJson(const json::Value &v)
     m.content = v["content"].str();
     m.type = (int)v["type"].asInt();
     m.edited = !v["edited_timestamp"].isNull();
+    parseMentions(v["mentions"], m.mention_names, &m.mention_users);
+    for (const auto &r : v["mention_roles"].items())
+        m.mention_roles.push_back(r.asId());
+    m.mention_everyone = v["mention_everyone"].asBool();
     m.nonce = v["nonce"].isString() ? v["nonce"].asString() : v["nonce"].isNumber() ? std::to_string(v["nonce"].asId()) : "";
     for (const auto &a : v["attachments"].items()) {
         Attachment att;
         att.filename = a["filename"].str();
         att.url = a["url"].str();
+        att.proxy_url = a["proxy_url"].str();
+        att.content_type = a["content_type"].str();
         att.size = a["size"].asId();
+        att.width = (int)a["width"].asInt();
+        att.height = (int)a["height"].asInt();
+        att.spoiler = att.filename.rfind("SPOILER_", 0) == 0 || (a["flags"].asInt() & 8);
         m.attachments.push_back(att);
     }
     m.embed_count = (int)v["embeds"].size();
-    if (m.embed_count) {
-        const auto &e = v["embeds"][(size_t)0];
-        m.embed_summary = e["title"].str();
+    for (const auto &e : v["embeds"].items()) {
+        const std::string &type = e["type"].asString();
+        // Image and GIF links: the thumbnail is the picture (a still for gifv).
+        // Other embeds: their large image, if any.
+        const json::Value &img = (type == "image" || type == "gifv") ? e["thumbnail"] : e["image"];
+        std::string url = img["proxy_url"].str();
+        if (url.empty())
+            url = img["url"].str();
+        if (!url.empty() && m.embed_images.size() < 4) {
+            EmbedImage ei;
+            ei.url = url;
+            ei.width = (int)img["width"].asInt();
+            ei.height = (int)img["height"].asInt();
+            ei.gifv = type == "gifv";
+            ei.link = e["url"].str();
+            ei.media_only = type == "gifv" || type == "image";
+            ei.provider = e["provider"]["name"].str();
+            if (ei.gifv) {
+                ei.video_url = e["video"]["url"].str();
+                ei.animated_url = gifvAnimatedUrl(ei.video_url);
+            }
+            m.embed_images.push_back(std::move(ei));
+        }
+    }
+    for (const auto &e : v["embeds"].items()) {
+        // The first embed with text gives the summary line.
+        std::string summary = e["title"].str();
         std::string desc = e["description"].str();
         if (!desc.empty()) {
-            if (!m.embed_summary.empty())
-                m.embed_summary += " - ";
-            m.embed_summary += desc;
+            if (!summary.empty())
+                summary += " - ";
+            summary += desc;
+        }
+        if (!summary.empty()) {
+            m.embed_summary = summary;
+            break;
         }
     }
     const auto &ref = v["referenced_message"];
@@ -264,11 +331,76 @@ Message Message::fromJson(const json::Value &v)
         m.has_reply = true;
         m.reply_author = User::fromJson(ref["author"]).displayName();
         m.reply_content = ref["content"].str();
+        parseMentions(ref["mentions"], m.mention_names, nullptr);
     } else if (v["message_reference"].isObject() && m.type == 19) {
         m.has_reply = true;
         m.reply_content = "(original message was deleted)";
     }
     return m;
+}
+
+std::string gifvAnimatedUrl(const std::string &video_url)
+{
+    auto endsWith = [](const std::string &s, const std::string &suffix) {
+        return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    // Tenor: https://media.tenor.com/<id>AAAPo/<name>.mp4, where the last
+    // five characters of the id pick the format: AAAPo is MP4, AAAAC GIF.
+    const std::string tenor = "https://media.tenor.com/";
+    if (video_url.compare(0, tenor.size(), tenor) == 0 && endsWith(video_url, ".mp4")) {
+        size_t slash = video_url.find('/', tenor.size());
+        if (slash == std::string::npos || slash - tenor.size() <= 5 || video_url.find('?') != std::string::npos)
+            return {};
+        std::string id = video_url.substr(tenor.size(), slash - tenor.size() - 5);
+        std::string name = video_url.substr(slash + 1, video_url.size() - slash - 1 - 4);
+        if (name.find('/') != std::string::npos)
+            return {};
+        return tenor + id + "AAAAC/" + name + ".gif";
+    }
+    // Giphy: https://media.giphy.com/media/<id>/giphy.mp4 (or mediaN.giphy.com)
+    const std::string giphy_suffix = "/giphy.mp4";
+    if (endsWith(video_url, giphy_suffix) && video_url.find('?') == std::string::npos) {
+        std::string host = video_url.compare(0, 8, "https://") == 0
+                               ? video_url.substr(8, video_url.find('/', 8) - 8)
+                               : std::string();
+        bool media_host = host == "media.giphy.com" ||
+                          (host.size() == 16 && host.compare(0, 5, "media") == 0 && isdigit((unsigned char)host[5]) &&
+                           host.compare(6, 10, ".giphy.com") == 0);
+        if (media_host)
+            return video_url.substr(0, video_url.size() - 4) + ".gif";
+    }
+    // Klipy names each format of a GIF with its own random file name, so its
+    // GIF can't be derived from the MP4; Klipy GIFs show as a still.
+    return {};
+}
+
+bool Message::contentIsEmbedLink() const
+{
+    size_t a = content.find_first_not_of(" \n\t"), b = content.find_last_not_of(" \n\t");
+    if (a == std::string::npos)
+        return false;
+    std::string text = content.substr(a, b - a + 1);
+    // <https://...> suppresses embeds, so it never matches one.
+    for (const auto &e : embed_images)
+        if (e.media_only && !e.link.empty() && text == e.link)
+            return true;
+    return false;
+}
+
+bool Attachment::isImage() const
+{
+    if (content_type.rfind("image/", 0) == 0)
+        return true;
+    if (!content_type.empty() || width <= 0 || height <= 0)
+        return false;
+    // Older messages may lack content_type: go by the extension.
+    size_t dot = filename.rfind('.');
+    if (dot == std::string::npos)
+        return false;
+    std::string ext = filename.substr(dot + 1);
+    for (auto &c : ext)
+        c = (char)tolower((unsigned char)c);
+    return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif" || ext == "webp";
 }
 
 void Message::applyUpdate(const json::Value &v)
@@ -277,11 +409,29 @@ void Message::applyUpdate(const json::Value &v)
         content = v["content"].str();
     if (v.has("edited_timestamp"))
         edited = !v["edited_timestamp"].isNull();
+    if (v.has("mentions") || v.has("mention_roles") || v.has("mention_everyone")) {
+        Message fresh = fromJson(v);
+        if (v.has("mentions")) {
+            // Keep the reply preview's names, replace the message's own.
+            for (auto &n : fresh.mention_names)
+                if (!mentionName(n.first))
+                    mention_names.push_back(n);
+            for (auto &n : mention_names)
+                if (const std::string *nn = fresh.mentionName(n.first))
+                    n.second = *nn;
+            mention_users = fresh.mention_users;
+        }
+        if (v.has("mention_roles"))
+            mention_roles = fresh.mention_roles;
+        if (v.has("mention_everyone"))
+            mention_everyone = fresh.mention_everyone;
+    }
     if (v.has("embeds") || v.has("attachments")) {
         Message fresh = fromJson(v);
         if (v.has("embeds")) {
             embed_count = fresh.embed_count;
             embed_summary = fresh.embed_summary;
+            embed_images = fresh.embed_images;
         }
         if (v.has("attachments"))
             attachments = fresh.attachments;

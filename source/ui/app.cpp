@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include "discord/cdn.h"
+#include "discord/emotes.h"
 #include "discord/rest.h"
 #include "util/util.h"
 
@@ -42,6 +43,8 @@ constexpr float kUserPanelH = 56;
 
 constexpr float kTextSize = 17;
 constexpr float kSmallSize = 14;
+// Emote-only messages: emotes are drawn 48 px tall, like Discord's jumbo emoji.
+constexpr float kJumboTextSize = 48 / Renderer::kInlineSize;
 
 // Mouse mode: optical travel (logical px) that engages it, idle time that
 // ends it, and logical px scrolled per wheel step of the Joy-Con stick.
@@ -419,6 +422,7 @@ void App::finishLogin(const std::string &token)
 
 void App::logOut(const std::string &message)
 {
+    m_viewerOpen = false;
     m_client.stop();
     config::clearToken();
     m_token.clear();
@@ -575,6 +579,10 @@ void App::activate()
                 m_pane = Pane::Messages;
             }
         }
+    } else if (!m_imageHits.empty()) {
+        // The newest picture on screen.
+        const ImageHit &h = m_imageHits.back();
+        openViewer(h.layout, h.image);
     } else {
         composeMessage();
     }
@@ -582,6 +590,10 @@ void App::activate()
 
 void App::back()
 {
+    if (m_viewerOpen) {
+        m_viewerOpen = false;
+        return;
+    }
     if (m_pane == Pane::Messages)
         m_pane = Pane::Channels;
     else if (m_pane == Pane::Channels)
@@ -633,6 +645,22 @@ bool App::hovering(Rect r) const
 
 void App::tapAt(float x, float y)
 {
+    if (m_viewerOpen) {
+        m_viewerOpen = false;
+        return;
+    }
+    if (m_screen == Screen::Main) {
+        for (const ImageHit &h : m_imageHits) {
+            if (!h.rect.contains(x, y))
+                continue;
+            const ImageBlock &img = m_layout[h.layout].images[h.image];
+            if (img.spoiler && !m_revealed.count(img.source))
+                m_revealed.insert(img.source);
+            else
+                openViewer(h.layout, h.image);
+            return;
+        }
+    }
     if (m_screen == Screen::Login) {
         if (kQrLogin && qrPanelRect().contains(x, y)) {
             m_remote.refresh();
@@ -850,6 +878,10 @@ void App::handleInput()
 
     if (m_screen == Screen::Login) {
         handleLoginInput(down);
+        return;
+    }
+    if (m_viewerOpen) {
+        handleViewerInput(down);
         return;
     }
 
@@ -1145,6 +1177,8 @@ void App::drawMain()
                          kSmallSize, col::muted);
         }
     }
+    if (m_viewerOpen)
+        drawViewer();
 }
 
 void App::drawAvatar(float cx, float cy, float radius, const std::string &name, Snowflake id,
@@ -1301,6 +1335,56 @@ void App::drawUserPanel(Rect area)
     m_r.drawText(area.x + 54, area.y + 30, sub, 12, m_frameTime < m_logoutArmedUntil ? col::danger : col::muted);
 }
 
+discord::MentionLookup App::mentionLookup(const Message *m)
+{
+    discord::MentionLookup lk;
+    Channel *ch = m_openChannel ? m_client.findChannel(m_openChannel) : nullptr;
+    Guild *g = ch && ch->guild_id ? m_client.findGuild(ch->guild_id) : nullptr;
+    lk.user = [this, m, ch](uint64_t id, std::string &name) {
+        if (m)
+            if (const std::string *n = m->mentionName(id)) {
+                name = *n;
+                return true;
+            }
+        if (id == m_client.me().id) {
+            name = m_client.me().displayName();
+            return true;
+        }
+        if (ch)
+            for (const auto &r : ch->recipients)
+                if (r.id == id) {
+                    name = r.displayName();
+                    return true;
+                }
+        return false;
+    };
+    lk.role = [g](uint64_t id, std::string &name, uint32_t &color) {
+        if (g)
+            for (const auto &r : g->roles)
+                if (r.id == id) {
+                    name = r.name;
+                    color = r.color;
+                    return true;
+                }
+        return false;
+    };
+    lk.channel = [this](uint64_t id, std::string &name) {
+        Channel *c = m_client.findChannel(id);
+        if (!c)
+            return false;
+        name = c->isDm() ? c->label() : c->name;
+        return true;
+    };
+    lk.time = [](int64_t when, char style) {
+        LocalTime t{};
+        if (!localTime(when, t))
+            return std::to_string(when);
+        return discord::formatTimestamp(when, unixNow(), style,
+                                        {t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday});
+    };
+    return lk;
+}
+
 void App::rebuildLayout(float width)
 {
     auto &cm = m_client.messages(m_openChannel);
@@ -1345,21 +1429,133 @@ void App::rebuildLayout(float width)
             }
             L.text_color = col::muted;
         }
-        if (!content.empty())
-            L.lines = m_r.wrapText(content, kTextSize, text_w);
+        if (!system && m.contentIsEmbedLink())
+            content.clear();  // the GIF/image below is the message
+        discord::MentionText mt = discord::resolveMentions(content, mentionLookup(&m), !system);
+        discord::EmoteText et = discord::extractEmotes(mt.text, Renderer::kInlineFirst, Renderer::kInlineLast);
+        for (const auto &sp : mt.spans) {
+            MessageLayout::SpanStyle st{Color::hex(0xc9cdfb), Color(88, 101, 242, 77)};
+            if (sp.kind == discord::MentionKind::Role && sp.color)
+                st = {Color::hex(sp.color), Color::hex(sp.color, 26)};
+            else if (sp.kind == discord::MentionKind::Time)
+                st = {L.text_color, Color(255, 255, 255, 18)};
+            L.span_styles.push_back(st);
+        }
+        if (!m.pending && !m.failed) {
+            Snowflake me = m_client.me().id;
+            L.mentions_me = m.mention_everyone ||
+                            std::find(m.mention_users.begin(), m.mention_users.end(), me) != m.mention_users.end();
+            if (!L.mentions_me && !m.mention_roles.empty() && m.guild_id)
+                if (Guild *g = m_client.findGuild(m.guild_id))
+                    for (Snowflake r : m.mention_roles)
+                        if (std::find(g->my_roles.begin(), g->my_roles.end(), r) != g->my_roles.end())
+                            L.mentions_me = true;
+        }
+        L.text_size = et.jumbo ? kJumboTextSize : kTextSize;
+        if (!et.emotes.empty()) {
+            // Ask the CDN for a power of two at least the drawn size.
+            float drawn = L.text_size * Renderer::kInlineSize * m_r.scale();
+            int px = 16;
+            while (px < drawn && px < 256)
+                px *= 2;
+            for (const auto &e : et.emotes)
+                L.emotes.push_back(discord::emotePath(e, px));
+        }
+        if (!et.text.empty())
+            L.lines = m_r.wrapText(et.text, L.text_size, text_w);
+        L.line_emotes.resize(L.lines.size());
+        // Split lines at mention markers into runs.
+        L.line_runs.resize(L.lines.size());
+        int active = -1;  // mention span carried over from the previous line
+        for (size_t li = 0; li < L.lines.size(); li++) {
+            const std::string &line = L.lines[li];
+            size_t i = 0, seg = 0;
+            auto flush = [&](size_t end) {
+                if (end > seg) {
+                    MessageLayout::Run run;
+                    run.x = m_r.measureText(std::string_view(line).substr(0, seg), L.text_size);
+                    run.text = line.substr(seg, end - seg);
+                    run.w = m_r.measureText(run.text, L.text_size);
+                    run.span = active;
+                    L.line_runs[li].push_back(std::move(run));
+                }
+            };
+            while (i < line.size()) {
+                size_t start = i;
+                uint32_t cp = utf8Next(line, i);
+                if (cp == discord::kMentionMarkEnd) {
+                    flush(start);
+                    active = -1;
+                    seg = i;
+                } else if (cp >= discord::kMentionMarkFirst && cp < discord::kMentionMarkFirst + mt.spans.size()) {
+                    flush(start);
+                    active = (int)(cp - discord::kMentionMarkFirst);
+                    seg = i;
+                }
+            }
+            flush(line.size());
+        }
+        if (!et.emotes.empty()) {
+            for (size_t li = 0; li < L.lines.size(); li++) {
+                const std::string &line = L.lines[li];
+                size_t i = 0;
+                while (i < line.size()) {
+                    size_t start = i;
+                    uint32_t cp = utf8Next(line, i);
+                    if (cp >= Renderer::kInlineFirst && cp < Renderer::kInlineFirst + L.emotes.size())
+                        L.line_emotes[li].push_back(
+                            {m_r.measureText(std::string_view(line).substr(0, start), L.text_size),
+                             cp - Renderer::kInlineFirst});
+                }
+            }
+        }
         if (m.has_reply) {
-            std::string r = (m.reply_author.empty() ? "" : "@" + m.reply_author + " ") + m.reply_content;
+            std::string r = (m.reply_author.empty() ? "" : "@" + m.reply_author + " ") +
+                            discord::emotesAsText(discord::resolveMentions(m.reply_content, mentionLookup(&m), false).text);
             for (auto &c : r)
                 if (c == '\n')
                     c = ' ';
             L.reply = m_r.ellipsize(r, 13, text_w);
         }
+        const float img_max_w = std::min(400.0f, text_w), img_max_h = 300;
+        auto addImage = [&](const std::string &source, const std::string &name, int sw, int sh, bool spoiler,
+                            const std::string &animated) {
+            ImageBlock b;
+            b.source = source;
+            b.animated = animated;
+            b.name = name;
+            b.src_w = sw;
+            b.src_h = sh;
+            b.spoiler = spoiler;
+            fitImage(sw, sh, img_max_w, img_max_h, false, b.w, b.h);
+            float s = m_r.scale();
+            b.url = discord::cdn::sizedImageUrl(source, (int)std::ceil(b.w * s), (int)std::ceil(b.h * s));
+            L.images.push_back(std::move(b));
+        };
+        for (const auto &a : m.attachments)
+            if (a.isImage() && L.images.size() < 10)
+                addImage(discord::cdn::attachmentImageUrl(a), a.filename, a.width, a.height, a.spoiler, {});
+        for (const auto &e : m.embed_images) {
+            addImage(e.url, {}, e.width, e.height, false, e.animated_url);
+            // GIF embeds we can't animate: say where they come from, once, so
+            // support for the provider can be added.
+            if (e.gifv && e.animated_url.empty()) {
+                static std::set<std::string> logged;
+                if (logged.size() < 50 && logged.insert(e.video_url).second)
+                    logf("app: can't animate a %s GIF: video %s, still %s",
+                         e.provider.empty() ? "(unknown provider)" : e.provider.c_str(), e.video_url.c_str(),
+                         discord::cdn::imageCacheKey(e.url).c_str());
+            }
+        }
+
         for (const auto &a : m.attachments) {
+            if (a.isImage())
+                continue;
             char size_buf[32];
             snprintf(size_buf, sizeof(size_buf), " (%.1f KB)", a.size / 1024.0);
             L.extras.push_back({"[file] " + a.filename + size_buf, col::link});
         }
-        if (m.embed_count) {
+        if (m.embed_count && !(m.embed_summary.empty() && !m.embed_images.empty())) {
             std::string e = m.embed_summary.empty() ? "[embed]" : "[embed] " + m.embed_summary;
             for (auto &c : e)
                 if (c == '\n')
@@ -1374,10 +1570,14 @@ void App::rebuildLayout(float width)
             h += 14 + lh;  // gap + name row
         if (!L.reply.empty())
             h += 20;
-        h += L.lines.size() * lh;
+        h += L.lines.size() * m_r.lineHeight(L.text_size);
+        for (const auto &img : L.images)
+            h += img.h + 6;
+        if (!L.images.empty() && !L.lines.empty())
+            h += 4;
         h += L.extras.size() * (kSmallSize * 1.5f);
         h += L.show_header ? 4 : 2;
-        if (L.show_header && L.lines.empty() && L.extras.empty())
+        if (L.show_header && L.lines.empty() && L.extras.empty() && L.images.empty())
             h += 4;
         L.height = h;
         m_layoutHeight += h;
@@ -1402,7 +1602,7 @@ void App::drawMessages(Rect area)
     std::string title = ch->label();
     float tw = m_r.drawText(area.x + 18, area.y + 14, m_r.ellipsize(title, 17, area.w / 2), 17, col::bright);
     if (!ch->topic.empty()) {
-        std::string topic = ch->topic;
+        std::string topic = discord::emotesAsText(discord::resolveMentions(ch->topic, mentionLookup(nullptr), false).text);
         for (auto &c : topic)
             if (c == '\n')
                 c = ' ';
@@ -1432,12 +1632,18 @@ void App::drawMessages(Rect area)
     }
     const float lh = m_r.lineHeight(kTextSize);
     const float tx = view.x + 72;
-    for (const MessageLayout &L : m_layout) {
+    m_imageHits.clear();
+    for (size_t li = 0; li < m_layout.size(); li++) {
+        const MessageLayout &L = m_layout[li];
         if (y + L.height < view.y || y > view.y + view.h) {
             y += L.height;
             continue;
         }
         float cy = y;
+        if (L.mentions_me) {
+            m_r.fillRect({view.x, y, view.w, L.height}, Color(240, 177, 50, 20));
+            m_r.fillRect({view.x, y, 2, L.height}, col::warn);
+        }
         if (L.show_header) {
             cy += 14;
             if (!L.reply.empty()) {
@@ -1451,9 +1657,64 @@ void App::drawMessages(Rect area)
             m_r.drawText(tx + nw + 10, cy + 3, L.time, 12, col::faint);
             cy += lh;
         }
-        for (const auto &line : L.lines) {
-            m_r.drawText(tx, cy, line, kTextSize, L.text_color);
-            cy += lh;
+        const float line_h = m_r.lineHeight(L.text_size);
+        const float emote = L.text_size * Renderer::kInlineSize;
+        const float slot = L.text_size * Renderer::kInlineAdvance;
+        for (size_t li = 0; li < L.lines.size(); li++) {
+            for (const auto &run : L.line_runs[li]) {
+                if (run.span < 0) {
+                    m_r.drawText(tx + run.x, cy, run.text, L.text_size, L.text_color);
+                    continue;
+                }
+                const auto &st = L.span_styles[run.span];
+                m_r.fillRoundRect({tx + run.x - 2, cy + 1, run.w + 4, line_h - 2}, 4, st.bg);
+                m_r.drawText(tx + run.x, cy, run.text, L.text_size, st.fg);
+            }
+            for (const auto &pe : L.line_emotes[li]) {
+                Rect r{tx + pe.first + (slot - emote) / 2, cy + (line_h - emote) / 2, emote, emote};
+                if (r.y + r.h < view.y || r.y > view.y + view.h)
+                    continue;
+                if (GLuint tex = m_images.get(L.emotes[pe.second]))
+                    m_r.drawImage(tex, r, Shape::Rect);
+                else
+                    m_r.fillRoundRect(r, 4, col::bg_input);
+            }
+            cy += line_h;
+        }
+        if (!L.images.empty() && !L.lines.empty())
+            cy += 4;
+        for (size_t ii = 0; ii < L.images.size(); ii++) {
+            const ImageBlock &img = L.images[ii];
+            Rect r{tx, cy + 2, img.w, img.h};
+            cy += img.h + 6;
+            if (r.y + r.h < view.y || r.y > view.y + view.h)
+                continue;
+            bool hidden = img.spoiler && !m_revealed.count(img.source);
+            bool failed = false;
+            // GIF embeds: the still shows until the animation has loaded.
+            bool anim_failed = false;
+            GLuint tex = hidden || img.animated.empty() ? 0 : m_images.get(img.animated, &anim_failed);
+            if (anim_failed) {
+                static std::set<std::string> logged;
+                if (logged.size() < 50 && logged.insert(img.animated).second)
+                    logf("app: no GIF at %s, showing the still", img.animated.c_str());
+            }
+            if (!tex && !hidden)
+                tex = m_images.get(img.url, &failed);
+            if (tex) {
+                m_r.drawImage(tex, r, Shape::Rounded);
+                if (hovering(r))
+                    m_r.fillRoundRect(r, 6, Color(255, 255, 255, 24));
+            } else {
+                m_r.fillRoundRect(r, 6, hovering(r) ? col::hover : col::bg_input);
+                const char *label = hidden ? "SPOILER" : failed ? "Image unavailable" : "Loading image...";
+                float size = hidden ? 15 : 13;
+                m_r.drawText(r.x + r.w / 2 - m_r.measureText(label, size) / 2, r.y + r.h / 2 - size * 0.7f, label,
+                             size, hidden ? col::bright : col::faint);
+            }
+            // Only the visible part counts for taps.
+            float top = std::max(r.y, view.y), bottom = std::min(r.y + r.h, view.y + view.h);
+            m_imageHits.push_back({{r.x, top, r.w, bottom - top}, li, ii});
         }
         for (const auto &e : L.extras) {
             m_r.drawText(tx, cy + 2, e.first, kSmallSize, e.second);
@@ -1492,6 +1753,111 @@ void App::drawMessages(Rect area)
     }
 }
 
+// --- Image viewer ------------------------------------------------------------
+
+void App::fitImage(int src_w, int src_h, float max_w, float max_h, bool allow_up, float &w, float &h)
+{
+    if (src_w <= 0 || src_h <= 0) {
+        // Unknown size: a 16:9 box.
+        w = std::min(max_w, max_h * 16 / 9);
+        h = w * 9 / 16;
+        return;
+    }
+    float k = std::min(max_w / src_w, max_h / src_h);
+    if (!allow_up)
+        k = std::min(k, 1.0f);
+    w = std::max(16.0f, std::floor(src_w * k));
+    h = std::max(16.0f, std::floor(src_h * k));
+}
+
+void App::openViewer(size_t layout, size_t image)
+{
+    m_viewerImages.clear();
+    m_viewerIndex = 0;
+    for (size_t li = 0; li < m_layout.size(); li++) {
+        for (size_t ii = 0; ii < m_layout[li].images.size(); ii++) {
+            if (li == layout && ii == image)
+                m_viewerIndex = m_viewerImages.size();
+            m_viewerImages.push_back(m_layout[li].images[ii]);
+        }
+    }
+    if (m_viewerImages.empty())
+        return;
+    m_revealed.insert(m_viewerImages[m_viewerIndex].source);
+    m_viewerOpen = true;
+}
+
+void App::handleViewerInput(u64 down)
+{
+    if (down & (HidNpadButton_B | HidNpadButton_A)) {
+        m_viewerOpen = false;
+        return;
+    }
+    int step = 0;
+    if (down & (HidNpadButton_Left | HidNpadButton_StickLLeft | HidNpadButton_L | HidNpadButton_ZL))
+        step = -1;
+    if (down & (HidNpadButton_Right | HidNpadButton_StickLRight | HidNpadButton_R | HidNpadButton_ZR))
+        step = 1;
+    if (step) {
+        long next = (long)m_viewerIndex + step;
+        if (next >= 0 && next < (long)m_viewerImages.size()) {
+            m_viewerIndex = (size_t)next;
+            m_revealed.insert(m_viewerImages[m_viewerIndex].source);
+        }
+    }
+}
+
+void App::drawViewer()
+{
+    const float W = Renderer::kWidth, H = Renderer::kHeight;
+    m_r.fillRect({0, 0, W, H}, Color(0, 0, 0, 225));
+    if (m_viewerIndex >= m_viewerImages.size())
+        return;
+    const ImageBlock &img = m_viewerImages[m_viewerIndex];
+
+    float w, h;
+    fitImage(img.src_w, img.src_h, W - 100, H - 120, true, w, h);
+    // Don't blow tiny images up past twice their size.
+    if (img.src_w > 0 && w > img.src_w * 2) {
+        h *= img.src_w * 2 / w;
+        w = img.src_w * 2.0f;
+    }
+    Rect r{std::floor(W / 2 - w / 2), std::floor((H - 50) / 2 - h / 2), w, h};
+
+    float s = m_r.scale();
+    int rw = std::min((int)std::ceil(w * s), ImageCache::kMaxImageSide);
+    int rh = std::min((int)std::ceil(h * s), ImageCache::kMaxImageSide);
+    if (img.src_w > 0) {
+        rw = std::min(rw, img.src_w);
+        rh = std::min(rh, img.src_h);
+    }
+    bool failed = false;
+    GLuint full = !img.animated.empty() ? m_images.get(img.animated, &failed)
+                                        : m_images.get(discord::cdn::sizedImageUrl(img.source, rw, rh), &failed);
+    // While the big version loads, stretch the list-sized one.
+    GLuint tex = full ? full : m_images.get(img.url);
+    if (tex)
+        m_r.drawImage(tex, r, Shape::Rounded);
+    else
+        m_r.fillRoundRect(r, 6, col::bg_channels);
+    if (!full) {
+        const char *label = failed ? "Couldn't load the full image" : "Loading...";
+        float lw = m_r.measureText(label, 13);
+        Rect pill{W / 2 - lw / 2 - 12, r.y + r.h - 34, lw + 24, 24};
+        m_r.fillRoundRect(pill, 12, Color(0, 0, 0, 170));
+        m_r.drawText(pill.x + 12, pill.y + 4, label, 13, col::text);
+    }
+
+    std::string caption = img.name.empty() ? "Image" : img.name;
+    if (m_viewerImages.size() > 1)
+        caption += "   " + std::to_string(m_viewerIndex + 1) + " / " + std::to_string(m_viewerImages.size());
+    caption = m_r.ellipsize(caption, kSmallSize, W / 2);
+    m_r.drawText(24, H - 34, caption, kSmallSize, col::text);
+    std::string hint = m_mouseMode ? "(Click) Close" : m_viewerImages.size() > 1 ? "(Left/Right) Previous / next   (B) Close"
+                                                                                : "(B) Close";
+    m_r.drawText(W - 24 - m_r.measureText(hint, kSmallSize), H - 34, hint, kSmallSize, col::muted);
+}
+
 void App::drawHints(Rect area)
 {
     m_r.fillRect(area, col::bg_messages);
@@ -1504,7 +1870,10 @@ void App::drawHints(Rect area)
     switch (m_pane) {
     case Pane::Guilds: hints = "(A) Open   (L/R) Server   (-) Log out   (+) Exit"; break;
     case Pane::Channels: hints = "(A) Open   (B) Back   (L/R) Server   (+) Exit"; break;
-    case Pane::Messages: hints = "(X) Write   (Up/Down/RS) Scroll   (ZL/ZR) Page   (Y) Reload   (B) Back"; break;
+    case Pane::Messages:
+        hints = m_imageHits.empty() ? "(X) Write   (Up/Down/RS) Scroll   (ZL/ZR) Page   (Y) Reload   (B) Back"
+                                    : "(A) View image   (X) Write   (Up/Down/RS) Scroll   (ZL/ZR) Page   (B) Back";
+        break;
     }
     m_r.drawText(area.x + area.w - 18 - m_r.measureText(hints, 13), area.y + 7, hints, 13, col::faint);
 }

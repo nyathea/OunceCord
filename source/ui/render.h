@@ -28,7 +28,8 @@ struct Color {
     }
 };
 
-enum class Shape { Circle, Squircle };
+// Rounded: rectangle with 6px corners. Rect: no mask.
+enum class Shape { Circle, Squircle, Rounded, Rect };
 
 struct Rect {
     float x, y, w, h;
@@ -49,6 +50,15 @@ public:
     void fillRoundRect(Rect r, float radius, Color c);
     void fillCircle(float cx, float cy, float radius, Color c);
     void fillTriangle(float x0, float y0, float x1, float y1, float x2, float y2, Color c);
+
+    // Inline objects: codepoints in this private-use range draw nothing but
+    // take up kInlineAdvance x the text size, so images (emotes) can be laid
+    // out with text and drawn into the gaps (kInlineSize x the text size).
+    static constexpr uint32_t kInlineFirst = 0xF0000, kInlineLast = 0xFFFFD;
+    static constexpr float kInlineAdvance = 1.375f, kInlineSize = 1.25f;
+    // Codepoints in this range are invisible and take no space: markers the
+    // UI puts in text to find spans (mentions) after wrapping.
+    static constexpr uint32_t kMarkFirst = 0x100000, kMarkLast = 0x10FFFD;
 
     // Text. size is the pixel size in logical units. Returns the advance.
     float drawText(float x, float y, std::string_view text, float size, Color c,
@@ -93,7 +103,7 @@ private:
     GLuint m_program = 0, m_vao = 0, m_vbo = 0, m_atlasTex = 0;
     GLint m_uScreen = -1;
     GLuint m_imageProgram = 0;
-    GLint m_uImgScreen = -1, m_uImgRect = -1, m_uImgShape = -1;
+    GLint m_uImgScreen = -1, m_uImgRect = -1, m_uImgShape = -1, m_uImgRadius = -1;
     GLuint m_whiteTex = 0;
     std::vector<Vertex> m_verts;
     std::vector<Rect> m_clips;

@@ -4,6 +4,7 @@
 // channels, messages) driven by the controller or the touch screen.
 #pragma once
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,7 @@
 
 #include "discord/auth.h"
 #include "discord/client.h"
+#include "discord/mentions.h"
 #include "discord/remoteauth.h"
 #include "ui/images.h"
 #include "ui/render.h"
@@ -48,6 +50,22 @@ private:
         std::string icon;     // CDN path for DMs
     };
 
+    // A picture in a message (attachment or embed image).
+    struct ImageBlock {
+        std::string source;  // proxy URL, unsized
+        std::string url;     // sized for the message list
+        std::string name;    // file name, if any
+        std::string animated;  // Tenor/Giphy GIF to play instead of the still
+        float w = 0, h = 0;  // display size in the list
+        int src_w = 0, src_h = 0;  // original size (0 if unknown)
+        bool spoiler = false;
+    };
+
+    struct ImageHit {
+        Rect rect;
+        size_t layout = 0, image = 0;
+    };
+
     struct MessageLayout {
         Snowflake id = 0;
         Snowflake author_id = 0;
@@ -59,7 +77,28 @@ private:
         std::vector<std::pair<std::string, Color>> extras;  // reply/attachments/embeds
         std::string reply;
         Color text_color;
+        std::vector<ImageBlock> images;
+        // Custom emotes: the text has a placeholder for each (see
+        // discord/emotes.h); line_emotes gives where they sit on each line.
+        float text_size = 17;  // larger for emote-only ("jumbo") messages
+        std::vector<std::string> emotes;  // CDN paths
+        std::vector<std::vector<std::pair<float, uint32_t>>> line_emotes;  // x, emote index
+        // Each line split into runs of plain text and mentions (span >= 0
+        // indexes span_styles); a mention can continue onto the next line.
+        struct Run {
+            float x = 0, w = 0;
+            std::string text;
+            int span = -1;
+        };
+        struct SpanStyle {
+            Color fg, bg;
+        };
+        std::vector<std::vector<Run>> line_runs;
+        std::vector<SpanStyle> span_styles;
+        bool mentions_me = false;  // drawn with a highlighted background
     };
+    // Resolves names for mentions in a message (null: no message context).
+    discord::MentionLookup mentionLookup(const Message *m);
 
     Renderer m_r;
     ImageCache m_images;
@@ -100,6 +139,13 @@ private:
     float m_layoutHeight = 0;
     uint32_t m_layoutVersion = ~0u;
     Snowflake m_layoutChannel = 0;
+    std::vector<ImageHit> m_imageHits;    // images drawn this frame
+    std::set<std::string> m_revealed;     // spoilers the user opened
+
+    // Full-screen image viewer.
+    bool m_viewerOpen = false;
+    std::vector<ImageBlock> m_viewerImages;  // the channel's images, oldest first
+    size_t m_viewerIndex = 0;
 
     // Input repeat and touch.
     uint64_t m_repeatAt = 0;
@@ -167,6 +213,12 @@ private:
     void drawUserPanel(Rect area);
     void drawMessages(Rect area);
     void drawHints(Rect area);
+    void openViewer(size_t layout, size_t image);
+    void handleViewerInput(u64 down);
+    void drawViewer();
+    // Fits a src_w x src_h image inside max_w x max_h (no upscaling unless
+    // allow_up); unknown sizes get a 16:9 box.
+    static void fitImage(int src_w, int src_h, float max_w, float max_h, bool allow_up, float &w, float &h);
     // Draws the image at icon (a CDN path) as a circle, or a coloured circle
     // with the name's first letter while it loads or when there is none.
     void drawAvatar(float cx, float cy, float radius, const std::string &name, Snowflake id,

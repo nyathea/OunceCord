@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "util/json.h"
@@ -112,8 +113,35 @@ struct Guild {
 struct Attachment {
     std::string filename;
     std::string url;
+    std::string proxy_url;     // media.discordapp.net, which can resize
+    std::string content_type;  // "image/png", may be empty
     uint64_t size = 0;
+    int width = 0, height = 0;  // images and videos
+    bool spoiler = false;
+
+    // Shown inline as a picture (not a video or other file).
+    bool isImage() const;
 };
+
+// A picture from an embed (a link preview, or a posted image/GIF link).
+struct EmbedImage {
+    std::string url;  // proxied (images-ext-N.discordapp.net or media.discordapp.net)
+    int width = 0, height = 0;
+    // For Tenor/Giphy/Klipy GIF links ("gifv" embeds, which Discord only
+    // offers as MP4 plus a still): the provider's own GIF file, if we know
+    // how to find it. Empty otherwise.
+    std::string animated_url;
+    bool gifv = false;
+    // The embed's link, and whether the embed is just that picture (an
+    // image or GIF link), in which case Discord hides a link-only message.
+    std::string link;
+    bool media_only = false;
+    std::string provider;     // "Tenor", "KLIPY"... (for the log)
+    std::string video_url;    // gifv: the MP4 (for the log)
+};
+
+// The GIF file behind a Tenor/Giphy embed's MP4 URL, or empty.
+std::string gifvAnimatedUrl(const std::string &video_url);
 
 struct Message {
     Snowflake id = 0;
@@ -126,10 +154,18 @@ struct Message {
     std::vector<Attachment> attachments;
     int embed_count = 0;
     std::string embed_summary;  // title/description of the first embed
+    std::vector<EmbedImage> embed_images;
     // Replied-to message, if any.
     bool has_reply = false;
     std::string reply_author;
     std::string reply_content;
+    // Who and what the message mentions. Names cover the reply preview's
+    // mentions too: user id -> name (server nickname when known).
+    std::vector<std::pair<Snowflake, std::string>> mention_names;
+    std::vector<Snowflake> mention_users;  // this message's own user mentions
+    std::vector<Snowflake> mention_roles;
+    bool mention_everyone = false;
+    const std::string *mentionName(Snowflake id) const;
     // Local bookkeeping for messages we sent and are waiting on.
     std::string nonce;
     bool pending = false;
@@ -137,5 +173,8 @@ struct Message {
     std::string error;  // why sending failed
 
     static Message fromJson(const json::Value &v);
+    // True when the text is nothing but the link of an image/GIF embed that
+    // is shown below it (the official client hides the link then).
+    bool contentIsEmbedLink() const;
     void applyUpdate(const json::Value &v);
 };
