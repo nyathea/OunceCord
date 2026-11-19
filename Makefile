@@ -56,7 +56,7 @@ ARCH	:=	$(SWITCH2_CPU) -mtp=soft -fPIE
 CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
-CFLAGS	+=	$(INCLUDE) -I$(PORTLIBS)/include/freetype2 -D__SWITCH__
+CFLAGS	+=	$(INCLUDE) -I$(PORTLIBS)/include/freetype2 -D__SWITCH__ -DAPP_VERSION=\"$(APP_VERSION)\"
 
 CXXFLAGS	:= $(CFLAGS) -std=gnu++20 -fno-rtti -fno-exceptions
 

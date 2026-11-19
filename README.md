@@ -12,6 +12,7 @@ I really recommend using an alt account as 3rd party clients are against ToS and
 - Saving pictures from chat to `sdmc:/switch/OunceCord/Saved`, and sending pictures from that folder (put your own JPEG, PNG or GIF files there too)
 - Custom emotes, animated ones included (large when a message is only emotes, like Discord)
 - Mentions shown as names (users, roles, channels, @everyone) plus timestamps, with messages that mention you highlighted
+- Settings: dark, light and AMOLED themes, turning mouse mode and the touch screen on or off, and an experimental QR code login, plus the system version, platform, app version and homebrew environment
 - Animated GIFs, including Tenor and Giphy GIFs (fetched directly from Tenor/Giphy, since Discord only proxies those as video). Klipy GIFs show as a still for now
 
 ## Building
@@ -47,7 +48,7 @@ another client. The session is kept in `token.txt` so you stay logged in;
 | Right stick | Highlight messages, faster the further you push (click to jump to latest) |
 | ZL / ZR | Page up / down |
 | Y | Send the message in the text box |
-| - (twice) | Log out |
+| - | Settings (also the gear next to your name); log out is at the bottom |
 | + | Exit |
 
 Touch: tap servers and channels, drag to scroll, tap the message bar to write, the + to attach a screenshot, the x on it to remove it and the arrow to send, tap an image to view it (or reveal a spoiler). In the viewer, left/right (or L/R) go to the previous/next image, Y (or the Save button) saves it to the Saved folder, and B closes it.
@@ -56,6 +57,6 @@ Mouse mode: put a Joy-Con 2 on its side on a surface and slide it. A cursor
 appears; click with its L/ZL or R/ZR, hold and drag or use its stick to scroll, and press
 the d-pad (or leave it for 5 seconds) to go back to button controls. While in mouse mode,
 that Joy-Con's shoulder buttons and stick only act as the mouse; the other Joy-Con works
-as usual.
+as usual. Mouse mode and the touch screen can be turned off in settings.
 
 Special Thanks to: [Paicord](https://github.com/llsc12/Paicord) which was used as a reference.

@@ -6,31 +6,80 @@
 #include <cstring>
 
 #include "config.h"
+#include "settings.h"
 #include "discord/cdn.h"
 #include "discord/emotes.h"
 #include "discord/rest.h"
+#include "util/sysinfo.h"
 #include "util/util.h"
 
 namespace {
 
 namespace col {
-constexpr Color bg_guilds = Color::hex(0x1b1c20);
-constexpr Color bg_channels = Color::hex(0x26282d);
-constexpr Color bg_messages = Color::hex(0x303238);
-constexpr Color bg_panel = Color::hex(0x202226);
-constexpr Color bg_input = Color::hex(0x3a3d44);
-constexpr Color selected = Color::hex(0x41444b);
-constexpr Color hover = Color::hex(0x373a40);
-constexpr Color accent = Color::hex(0x5b6af0);
-constexpr Color accent_hover = Color::hex(0x4752c4);
-constexpr Color text = Color::hex(0xdcdee3);
-constexpr Color bright = Color::hex(0xf4f5f7);
-constexpr Color muted = Color::hex(0x959ba5);
-constexpr Color faint = Color::hex(0x6d727c);
-constexpr Color danger = Color::hex(0xf0484b);
-constexpr Color online = Color::hex(0x2fb164);
-constexpr Color warn = Color::hex(0xf0b232);
-constexpr Color link = Color::hex(0x00a8fc);
+// The current theme's colours (see applyTheme).
+Color bg_guilds, bg_channels, bg_messages, bg_panel, bg_input, selected, hover, accent, accent_hover, text, bright,
+    muted, faint, danger, online, warn, link;
+Color on_accent = Color::hex(0xffffff);  // text on accent/danger fills
+Color overlay;                           // a faint wash over rows: lighter on dark themes, darker on light
+Color mention_fg, mention_bg;
+Color scrim;                             // behind full-screen panels
+
+void applyTheme(Theme t)
+{
+    // Dark first; the others change what differs.
+    bg_guilds = Color::hex(0x1b1c20);
+    bg_channels = Color::hex(0x26282d);
+    bg_messages = Color::hex(0x303238);
+    bg_panel = Color::hex(0x202226);
+    bg_input = Color::hex(0x3a3d44);
+    selected = Color::hex(0x41444b);
+    hover = Color::hex(0x373a40);
+    accent = Color::hex(0x5b6af0);
+    accent_hover = Color::hex(0x4752c4);
+    text = Color::hex(0xdcdee3);
+    bright = Color::hex(0xf4f5f7);
+    muted = Color::hex(0x959ba5);
+    faint = Color::hex(0x6d727c);
+    danger = Color::hex(0xf0484b);
+    online = Color::hex(0x2fb164);
+    warn = Color::hex(0xf0b232);
+    link = Color::hex(0x00a8fc);
+    overlay = Color(255, 255, 255, 14);
+    mention_fg = Color::hex(0xc9cdfb);
+    mention_bg = Color(88, 101, 242, 77);
+    scrim = Color(17, 18, 20, 245);
+    if (t == Theme::Light) {
+        bg_guilds = Color::hex(0xe3e5e8);
+        bg_channels = Color::hex(0xf2f3f5);
+        bg_messages = Color::hex(0xffffff);
+        bg_panel = Color::hex(0xebedef);
+        bg_input = Color::hex(0xebedef);
+        selected = Color::hex(0xd4d7dc);
+        hover = Color::hex(0xe3e5e8);
+        accent = Color::hex(0x5865f2);
+        text = Color::hex(0x313338);
+        bright = Color::hex(0x060607);
+        muted = Color::hex(0x5c5e66);
+        faint = Color::hex(0x80848e);
+        danger = Color::hex(0xda373c);
+        online = Color::hex(0x23a55a);
+        warn = Color::hex(0xd59a00);
+        link = Color::hex(0x006ce7);
+        overlay = Color(0, 0, 0, 12);
+        mention_fg = Color::hex(0x4752c4);
+        mention_bg = Color(88, 101, 242, 38);
+        scrim = Color(242, 243, 245, 248);
+    } else if (t == Theme::Amoled) {
+        bg_guilds = Color::hex(0x000000);
+        bg_channels = Color::hex(0x000000);
+        bg_messages = Color::hex(0x000000);
+        bg_panel = Color::hex(0x0b0b0c);
+        bg_input = Color::hex(0x1a1b1e);
+        selected = Color::hex(0x26272b);
+        hover = Color::hex(0x17181a);
+        scrim = Color(0, 0, 0, 250);
+    }
+}
 }  // namespace col
 
 constexpr float kGuildBarW = 76;
@@ -93,6 +142,8 @@ std::string initials(const std::string &name)
 
 bool App::init()
 {
+    m_settings = Settings::load();
+    col::applyTheme(m_settings.theme);
     if (!m_r.init())
         return false;
     m_images.init();
@@ -201,16 +252,15 @@ namespace {
 // QR-code login (discord/remoteauth). Off for now: Discord answers the
 // ticket exchange with a captcha, which we can't show. Worth trying again
 // once the client identity (identity.json) carries current build numbers.
-constexpr bool kQrLogin = false;
 
 constexpr float kLoginFormW = 480;  // left column; the QR panel takes the right
-constexpr float kLoginCardW = kQrLogin ? 920 : kLoginFormW + 96, kLoginCardH = 480;
+constexpr float kLoginCardWQr = 920, kLoginCardWPlain = kLoginFormW + 96, kLoginCardH = 480;
 constexpr float kLoginRowH = 52, kLoginRowGap = 12;
 
-Rect loginCard()
+Rect loginCard(bool qr)
 {
-    return {Renderer::kWidth / 2 - kLoginCardW / 2, Renderer::kHeight / 2 - kLoginCardH / 2,
-            kLoginCardW, kLoginCardH};
+    float w = qr ? kLoginCardWQr : kLoginCardWPlain;
+    return {Renderer::kWidth / 2 - w / 2, Renderer::kHeight / 2 - kLoginCardH / 2, w, kLoginCardH};
 }
 
 // Keeps characters a code may contain; drops spaces and dashes.
@@ -254,7 +304,7 @@ std::vector<App::LoginItem> App::loginItems() const
                 it.enabled = !busy;
     }
 
-    Rect card = loginCard();
+    Rect card = loginCard(m_settings.qr_login);
     float y = card.y + 124;
     for (auto &it : items) {
         float h = it.field ? kLoginRowH + 20 : kLoginRowH - 6;
@@ -273,7 +323,7 @@ void App::handleLoginInput(u64 down)
         int dir = (down & HidNpadButton_AnyUp) ? -1 : 1;
         m_loginFocus = std::clamp(m_loginFocus + dir, 0, n - 1);
     }
-    if (kQrLogin && (down & HidNpadButton_Y))
+    if (m_settings.qr_login && (down & HidNpadButton_Y))
         m_remote.refresh();
     if (down & HidNpadButton_A)
         loginActivate(items[m_loginFocus].action);
@@ -550,7 +600,7 @@ void App::drawComposeMenu()
         const char *label = actions[i] == ComposeAction::Write    ? (d && !d->text.empty() ? "Edit message" : "Write a message")
                             : actions[i] == ComposeAction::Attach ? (d && d->has_image ? "Change picture" : "Attach a picture")
                                                                   : "Remove picture";
-        Color fg = focus ? col::bright : actions[i] == ComposeAction::Remove ? col::danger : col::text;
+        Color fg = focus ? col::on_accent : actions[i] == ComposeAction::Remove ? col::danger : col::text;
         m_r.drawText(it.x + 14, it.y + 12, label, 16, fg);
     }
 }
@@ -687,7 +737,7 @@ void App::handlePickerInput(u64 down, u64 held)
 void App::drawPicker()
 {
     const float W = Renderer::kWidth, H = Renderer::kHeight;
-    m_r.fillRect({0, 0, W, H}, Color(17, 18, 20, 245));
+    m_r.fillRect({0, 0, W, H}, col::scrim);
     m_r.drawText(40, 24, m_pickerTab ? "Attach a saved picture" : "Attach a screenshot", 22, col::bright);
     for (int t = 0; t < 2; t++) {
         Rect tr = pickerTabRect(t);
@@ -697,7 +747,7 @@ void App::drawPicker()
         if (!m_mouseMode)
             label = (t == 0 ? "(L) " : "(R) ") + label;
         m_r.drawText(tr.x + tr.w / 2 - m_r.measureText(label, 15) / 2, tr.y + 7, label, 15,
-                     on ? col::bright : col::text);
+                     on ? col::on_accent : col::text);
     }
     const auto &items = pickerItems();
     Rect g = pickerGridArea();
@@ -1063,6 +1113,18 @@ void App::tapAt(float x, float y)
             m_pickerOpen = false;  // tapping the title bar cancels
         return;
     }
+    if (m_settingsOpen) {
+        auto items = settingItems();
+        for (size_t i = 0; i < items.size(); i++)
+            if (items[i].rect.contains(x, y)) {
+                m_settingsIndex = (int)i;
+                changeSetting(items[i].row, 0);
+                return;
+            }
+        if (!settingsCardRect().contains(x, y))
+            m_settingsOpen = false;
+        return;
+    }
     if (m_composeMenuOpen) {
         auto actions = composeActions();
         Rect r = composeMenuRect(actions.size());
@@ -1085,7 +1147,7 @@ void App::tapAt(float x, float y)
         }
     }
     if (m_screen == Screen::Login) {
-        if (kQrLogin && qrPanelRect().contains(x, y)) {
+        if (m_settings.qr_login && qrPanelRect().contains(x, y)) {
             m_remote.refresh();
             return;
         }
@@ -1098,6 +1160,10 @@ void App::tapAt(float x, float y)
                 break;
             }
         }
+        return;
+    }
+    if (settingsGearRect().contains(x, y)) {
+        openSettings();
         return;
     }
     if (x < kGuildBarW) {
@@ -1155,6 +1221,10 @@ void App::wheelScroll(float x, float y, float amount)
 
 void App::handleTouch()
 {
+    if (!m_settings.touch) {
+        m_touching = false;
+        return;
+    }
     HidTouchScreenState state{};
     bool down = hidGetTouchScreenStates(&state, 1) && state.count > 0;
     if (down) {
@@ -1188,6 +1258,10 @@ u64 App::handlePointer()
 #if defined(__SWITCH2__)
     if (!m_pointerReady)
         return 0;
+    if (!m_settings.mouse) {
+        m_mouseMode = false;
+        return 0;
+    }
     padPointerUpdate(&m_pointer, &m_pad);
     if (!m_pointer.active) {
         m_mouseMode = false;
@@ -1327,6 +1401,10 @@ void App::handleInput()
         handleComposeMenuInput(down);
         return;
     }
+    if (m_settingsOpen) {
+        handleSettingsInput(down);
+        return;
+    }
 
     // A rejected session sends us back to the login screen.
     if (m_client.status() == discord::GatewayStatus::AuthFailed) {
@@ -1335,13 +1413,8 @@ void App::handleInput()
     }
 
     if (down & HidNpadButton_Minus) {
-        if (m_frameTime < m_logoutArmedUntil) {
-            // Ends the session on Discord's side too, so the token is useless.
-            m_auth.logout(m_token);
-            logOut("Logged out.");
-            return;
-        }
-        m_logoutArmedUntil = m_frameTime + 3000;
+        openSettings();
+        return;
     }
 
     // Up/down with key repeat.
@@ -1431,7 +1504,7 @@ bool App::frame()
         while (m_saver.takeResult(msg, ok))
             toast(msg, ok);
     }
-    if (kQrLogin && m_screen == Screen::Login) {
+    if (m_settings.qr_login && m_screen == Screen::Login) {
         if (!m_remoteStarted) {
             m_remote.start();
             m_remoteStarted = true;
@@ -1461,7 +1534,7 @@ void App::drawLogin()
 {
     const float W = Renderer::kWidth, H = Renderer::kHeight;
     m_r.fillRect({0, 0, W, H}, col::bg_guilds);
-    Rect card = loginCard();
+    Rect card = loginCard(m_settings.qr_login);
     m_r.fillRoundRect(card, 10, col::bg_channels);
 
     const float formCx = card.x + 48 + kLoginFormW / 2;
@@ -1472,7 +1545,7 @@ void App::drawLogin()
     const char *sub = m_loginStep == LoginStep::Mfa ? "Confirm it's you to finish logging in."
                                                     : "Log in to Discord with OunceCord.";
     m_r.drawText(formCx - m_r.measureText(sub, kTextSize) / 2, y, sub, kTextSize, col::muted);
-    if (kQrLogin)
+    if (m_settings.qr_login)
         drawQrPanel(qrPanelRect());
 
     auto items = loginItems();
@@ -1500,7 +1573,7 @@ void App::drawLogin()
                 m_r.fillRoundRect({r.x - 2, r.y - 2, r.w + 4, r.h + 4}, 6, col::bright);
             m_r.fillRoundRect(r, 4, bg);
             m_r.drawText(r.x + r.w / 2 - m_r.measureText(it.label, 17) / 2, r.y + r.h / 2 - 11, it.label, 17,
-                         it.enabled ? col::bright : col::muted);
+                         !it.enabled ? col::muted : it.primary ? col::on_accent : col::text);
         }
         bottom = r.y + r.h;
     }
@@ -1527,14 +1600,14 @@ void App::drawLogin()
     std::string hint = m_mouseMode ? "Click to select    (+) Exit"
                        : m_loginStep == LoginStep::Mfa ? "(A) Select    (B) Back    (+) Exit"
                                                        : "(A) Select    (+) Exit";
-    if (kQrLogin && stale && !m_mouseMode)
+    if (m_settings.qr_login && stale && !m_mouseMode)
         hint = "(Y) New QR code    " + hint;
     m_r.drawText(W - 24 - m_r.measureText(hint, kSmallSize), H - 32, hint, kSmallSize, col::muted);
 }
 
 Rect App::qrPanelRect() const
 {
-    Rect card = loginCard();
+    Rect card = loginCard(m_settings.qr_login);
     float x = card.x + 48 + kLoginFormW + 40;
     return {x, card.y + 30, card.x + card.w - 40 - x, 340};
 }
@@ -1650,6 +1723,8 @@ void App::drawMain()
         drawPicker();
     if (m_viewerOpen)
         drawViewer();
+    if (m_settingsOpen)
+        drawSettings();
     drawToast();
 }
 
@@ -1669,7 +1744,7 @@ void App::drawAvatar(float cx, float cy, float radius, const std::string &name, 
     }
     float size = radius * 0.95f;
     float w = m_r.measureText(ini, size);
-    m_r.drawText(cx - w / 2, cy - m_r.lineHeight(size) / 2 + 1, ini, size, col::bright);
+    m_r.drawText(cx - w / 2, cy - m_r.lineHeight(size) / 2 + 1, ini, size, col::on_accent);
 }
 
 void App::drawGuildBar(Rect area)
@@ -1715,7 +1790,8 @@ void App::drawGuildBar(Rect area)
         float size = label.size() > 3 ? 13 : 16;
         label = m_r.ellipsize(label, size, 44);
         float w = m_r.measureText(label, size);
-        m_r.drawText(cx - w / 2, cy - m_r.lineHeight(size) / 2 + 1, label, size, col::bright);
+        m_r.drawText(cx - w / 2, cy - m_r.lineHeight(size) / 2 + 1, label, size,
+                     is_sel || is_hover ? col::on_accent : col::text);
         if (i == 0)
             m_r.fillRect({area.x + 18, y + item + 1, area.w - 36, 2}, col::bg_input);
     }
@@ -1802,9 +1878,233 @@ void App::drawUserPanel(Rect area)
     }
     m_r.fillCircle(area.x + 40, area.y + area.h / 2 + 11, 6, col::bg_panel);
     m_r.fillCircle(area.x + 40, area.y + area.h / 2 + 11, 4, dot);
-    m_r.drawText(area.x + 54, area.y + 10, m_r.ellipsize(name, 15, area.w - 64), 15, col::bright);
-    std::string sub = m_frameTime < m_logoutArmedUntil ? "Press (-) again to log out" : status;
-    m_r.drawText(area.x + 54, area.y + 30, sub, 12, m_frameTime < m_logoutArmedUntil ? col::danger : col::muted);
+    m_r.drawText(area.x + 54, area.y + 10, m_r.ellipsize(name, 15, area.w - 64 - 44), 15, col::bright);
+    m_r.drawText(area.x + 54, area.y + 30, status, 12, col::muted);
+    // Settings: a gear, with (-) shown for controllers.
+    Rect g = settingsGearRect();
+    if (hovering(g))
+        m_r.fillRoundRect(g, 6, col::hover);
+    float gx = g.x + g.w / 2, gy = g.y + g.h / 2;
+    Color gc = hovering(g) ? col::bright : col::muted;
+    for (int k = 0; k < 8; k++) {  // teeth
+        float a = k * 3.14159265f / 4;
+        m_r.fillCircle(gx + std::cos(a) * 8.5f, gy + std::sin(a) * 8.5f, 2.6f, gc);
+    }
+    m_r.fillCircle(gx, gy, 8, gc);
+    m_r.fillCircle(gx, gy, 3.5f, col::bg_panel);
+    if (!m_mouseMode)
+        m_r.drawText(g.x - 24, gy - 8, "(-)", 12, col::faint);
+}
+
+// --- Settings ----------------------------------------------------------------
+
+constexpr float kSettingsW = 640, kSettingsRowH = 52, kSettingsHeadH = 34;
+
+Rect App::settingsCardRect() const
+{
+    return {Renderer::kWidth / 2 - kSettingsW / 2, 36, kSettingsW, Renderer::kHeight - 72};
+}
+
+Rect App::settingsGearRect() const
+{
+    return {kGuildBarW + kChannelW - 44, Renderer::kHeight - kUserPanelH + 12, 32, 32};
+}
+
+std::vector<App::SettingItem> App::settingItems() const
+{
+    Rect c = settingsCardRect();
+    float x = c.x + 28, w = c.w - 56, y = c.y + 76;
+    std::vector<SettingItem> out;
+    auto section = [&] { y += kSettingsHeadH; };
+    auto row = [&](SettingRow r, float h = kSettingsRowH) {
+        out.push_back({r, {x, y, w, h}});
+        y += h + 4;
+    };
+    section();  // Appearance
+    row(SettingRow::Theme);
+    y += 10;
+    section();  // Input
+    row(SettingRow::Mouse);
+    row(SettingRow::Touch);
+    y += 10;
+    section();  // Experimental
+    row(SettingRow::QrLogin, 72);
+    // Log out sits at the bottom of the card.
+    out.push_back({SettingRow::LogOut, {x, c.y + c.h - 28 - 48, w, 48}});
+    return out;
+}
+
+void App::openSettings()
+{
+    m_settingsOpen = true;
+    m_settingsIndex = 0;
+    m_logoutArmedUntil = 0;
+    m_composeMenuOpen = false;
+}
+
+void App::applySettings()
+{
+    col::applyTheme(m_settings.theme);
+    m_layoutVersion = ~0u;  // message colours are baked into the layout
+    if (!m_settings.qr_login && m_remoteStarted) {
+        m_remote.stop();
+        m_remoteStarted = false;
+    }
+    if (!m_settings.save())
+        toast("Couldn't save settings to the SD card.", false);
+}
+
+void App::changeSetting(SettingRow row, int dir)
+{
+    switch (row) {
+    case SettingRow::Theme: {
+        int t = (int)m_settings.theme + (dir ? dir : 1);
+        m_settings.theme = (Theme)((t % 3 + 3) % 3);
+        break;
+    }
+    case SettingRow::Mouse:
+        m_settings.mouse = dir ? dir > 0 : !m_settings.mouse;
+        break;
+    case SettingRow::Touch:
+        m_settings.touch = dir ? dir > 0 : !m_settings.touch;
+        break;
+    case SettingRow::QrLogin:
+        m_settings.qr_login = dir ? dir > 0 : !m_settings.qr_login;
+        break;
+    case SettingRow::LogOut:
+        if (dir)
+            return;
+        if (m_frameTime < m_logoutArmedUntil) {
+            // Ends the session on Discord's side too, so the token is useless.
+            m_settingsOpen = false;
+            m_logoutArmedUntil = 0;
+            m_auth.logout(m_token);
+            logOut("Logged out.");
+        } else {
+            m_logoutArmedUntil = m_frameTime + 3000;
+        }
+        return;
+    }
+    applySettings();
+}
+
+void App::handleSettingsInput(u64 down)
+{
+    auto items = settingItems();
+    if (down & (HidNpadButton_B | HidNpadButton_Minus)) {
+        m_settingsOpen = false;
+        return;
+    }
+    int n = (int)items.size();
+    if (down & HidNpadButton_AnyUp)
+        m_settingsIndex = (m_settingsIndex + n - 1) % n;
+    if (down & HidNpadButton_AnyDown)
+        m_settingsIndex = (m_settingsIndex + 1) % n;
+    m_settingsIndex = std::clamp(m_settingsIndex, 0, n - 1);
+    SettingRow r = items[m_settingsIndex].row;
+    if (r != SettingRow::LogOut)
+        m_logoutArmedUntil = 0;
+    if (down & HidNpadButton_A)
+        changeSetting(r, 0);
+    else if (down & HidNpadButton_AnyLeft)
+        changeSetting(r, -1);
+    else if (down & HidNpadButton_AnyRight)
+        changeSetting(r, 1);
+}
+
+void App::drawSettings()
+{
+    const float W = Renderer::kWidth, H = Renderer::kHeight;
+    m_r.fillRect({0, 0, W, H}, Color(0, 0, 0, 150));
+    Rect c = settingsCardRect();
+    m_r.fillRoundRect(c, 12, col::bg_channels);
+    m_r.drawText(c.x + 28, c.y + 24, "Settings", 24, col::bright);
+    const char *close = m_mouseMode ? "Click outside to close" : "(B) Close";
+    m_r.drawText(c.x + c.w - 28 - m_r.measureText(close, 13), c.y + 32, close, 13, col::faint);
+
+    auto items = settingItems();
+    m_settingsIndex = std::clamp(m_settingsIndex, 0, (int)items.size() - 1);
+    auto header = [&](const char *t, float y) { m_r.drawText(c.x + 28, y + 10, t, 12, col::muted); };
+    header("APPEARANCE", items[0].rect.y - kSettingsHeadH);
+    header("INPUT", items[1].rect.y - kSettingsHeadH);
+    header("EXPERIMENTAL", items[3].rect.y - kSettingsHeadH);
+
+    for (size_t i = 0; i < items.size(); i++) {
+        const SettingItem &it = items[i];
+        Rect r = it.rect;
+        bool focus = m_mouseMode ? hovering(r) : (int)i == m_settingsIndex;
+        if (it.row == SettingRow::LogOut) {
+            bool armed = m_frameTime < m_logoutArmedUntil;
+            m_r.fillRoundRect(r, 8, armed || focus ? col::danger : col::bg_input);
+            const char *t = armed ? (m_mouseMode ? "Click again to log out" : "Press (A) again to log out") : "Log out";
+            m_r.drawText(r.x + r.w / 2 - m_r.measureText(t, 17) / 2, r.y + 13, t, 17,
+                         armed || focus ? col::on_accent : col::danger);
+            continue;
+        }
+        m_r.fillRoundRect(r, 8, focus ? col::selected : col::bg_input);
+        if (focus && !m_mouseMode)
+            m_r.fillRoundRect({r.x, r.y + 8, 3, r.h - 16}, 1.5f, col::accent);
+        const char *label = "", *desc = nullptr;
+        bool toggle = true, on = false;
+        switch (it.row) {
+        case SettingRow::Theme: label = "Theme"; toggle = false; break;
+        case SettingRow::Mouse:
+            label = "Mouse mode";
+            desc = "Slide a Joy-Con 2 on a surface to use it as a mouse.";
+            on = m_settings.mouse;
+            break;
+        case SettingRow::Touch: label = "Touch screen"; on = m_settings.touch; break;
+        case SettingRow::QrLogin:
+            label = "QR code login";
+            desc = "Log in by scanning a code with the Discord app. Discord often asks for a captcha here, which "
+                   "OunceCord can't show.";
+            on = m_settings.qr_login;
+            break;
+        default: break;
+        }
+        float ty = desc ? r.y + 8 : r.y + r.h / 2 - 11;
+        m_r.drawText(r.x + 18, ty, label, 17, col::text);
+        if (desc) {
+            float dy = ty + 24;
+            for (const auto &line : m_r.wrapText(desc, 12, r.w - 18 - 90)) {
+                m_r.drawText(r.x + 18, dy, line, 12, col::muted);
+                dy += 16;
+            }
+        }
+        if (toggle) {
+            // A switch.
+            Rect sw{r.x + r.w - 18 - 44, r.y + r.h / 2 - 12, 44, 24};
+            m_r.fillRoundRect(sw, 12, on ? col::online : col::faint);
+            m_r.fillCircle(on ? sw.x + sw.w - 12 : sw.x + 12, sw.y + 12, 9, Color::hex(0xffffff));
+        } else {
+            // < Dark >
+            std::string v = Settings::themeName(m_settings.theme);
+            float vw = m_r.measureText(v, 16);
+            float rx = r.x + r.w - 18;
+            Color ac = focus ? col::text : col::faint;
+            m_r.fillTriangle(rx - 8, r.y + r.h / 2 - 6, rx, r.y + r.h / 2, rx - 8, r.y + r.h / 2 + 6, ac);
+            m_r.drawText(rx - 18 - vw, r.y + r.h / 2 - 10, v, 16, col::bright);
+            float lx = rx - 18 - vw - 14;
+            m_r.fillTriangle(lx, r.y + r.h / 2 - 6, lx - 8, r.y + r.h / 2, lx, r.y + r.h / 2 + 6, ac);
+        }
+    }
+    // About this console, in plain text under the settings.
+    {
+        const SystemInfo &si = SystemInfo::get();
+        const SettingItem &last = items[3];
+        float y = last.rect.y + last.rect.h + 18;
+        const std::pair<const char *, const std::string *> rows[] = {
+            {"HOS version", &si.hos}, {"Platform", &si.platform}, {"App version", &si.app}, {"Environment", &si.environment}};
+        float col_w = (c.w - 56) / 2;
+        for (int i = 0; i < 4; i++) {
+            float x = c.x + 28 + (i % 2) * col_w, ry = y + (i / 2) * 22;
+            float lw = m_r.drawText(x, ry, rows[i].first, 13, col::muted);
+            m_r.drawText(x + lw + 10, ry, m_r.ellipsize(*rows[i].second, 13, col_w - lw - 20), 13, col::text);
+        }
+    }
+    const char *hints = m_mouseMode ? "Click a setting to change it"
+                                    : "(Up/Down) Choose   (A) Change   (Left/Right) Pick theme   (B or -) Close";
+    m_r.drawText(c.x + c.w / 2 - m_r.measureText(hints, 13) / 2, c.y + c.h + 10, hints, 13, Color::hex(0xdcdee3));
 }
 
 discord::MentionLookup App::mentionLookup(const Message *m)
@@ -1906,11 +2206,11 @@ void App::rebuildLayout(float width)
         discord::MentionText mt = discord::resolveMentions(content, mentionLookup(&m), !system);
         discord::EmoteText et = discord::extractEmotes(mt.text, Renderer::kInlineFirst, Renderer::kInlineLast);
         for (const auto &sp : mt.spans) {
-            MessageLayout::SpanStyle st{Color::hex(0xc9cdfb), Color(88, 101, 242, 77)};
+            MessageLayout::SpanStyle st{col::mention_fg, col::mention_bg};
             if (sp.kind == discord::MentionKind::Role && sp.color)
                 st = {Color::hex(sp.color), Color::hex(sp.color, 26)};
             else if (sp.kind == discord::MentionKind::Time)
-                st = {L.text_color, Color(255, 255, 255, 18)};
+                st = {L.text_color, col::overlay};
             L.span_styles.push_back(st);
         }
         if (!m.pending && !m.failed) {
@@ -2135,7 +2435,7 @@ void App::drawMessages(Rect area)
         }
         float cy = y;
         if ((int)li == sel) {
-            m_r.fillRect({view.x, y, view.w, L.height}, Color(255, 255, 255, 14));
+            m_r.fillRect({view.x, y, view.w, L.height}, col::overlay);
             m_r.fillRect({view.x, y, 3, L.height}, col::accent);
         }
         if (L.mentions_me) {
@@ -2202,7 +2502,7 @@ void App::drawMessages(Rect area)
             if (tex) {
                 m_r.drawImage(tex, r, Shape::Rounded);
                 if (hovering(r))
-                    m_r.fillRoundRect(r, 6, Color(255, 255, 255, 24));
+                    m_r.fillRoundRect(r, 6, col::overlay);
             } else {
                 m_r.fillRoundRect(r, 6, hovering(r) ? col::hover : col::bg_input);
                 const char *label = hidden ? "SPOILER" : failed ? "Image unavailable" : "Loading image...";
@@ -2229,7 +2529,7 @@ void App::drawMessages(Rect area)
         Rect pill = jumpPillRect();
         m_r.fillRoundRect(pill, 14, hovering(pill) ? col::accent_hover : col::accent);
         const char *t = m_mouseMode ? "Jump to latest" : "(RS) Jump to latest";
-        m_r.drawText(pill.x + pill.w / 2 - m_r.measureText(t, 13) / 2, pill.y + 6, t, 13, col::bright);
+        m_r.drawText(pill.x + pill.w / 2 - m_r.measureText(t, 13) / 2, pill.y + 6, t, 13, col::on_accent);
     }
 
     // Input bar: the draft (or a placeholder) and a send button.
@@ -2263,7 +2563,7 @@ void App::drawMessages(Rect area)
             float xc = x.x + x.w / 2, yc = x.y + x.h / 2;
             m_r.fillCircle(xc, yc, 9, hovering(x) ? col::danger : col::selected);
             const char *times = "\xC3\x97";  // U+00D7
-            m_r.drawText(xc - m_r.measureText(times, 15) / 2, yc - 10, times, 15, col::bright);
+            m_r.drawText(xc - m_r.measureText(times, 15) / 2, yc - 10, times, 15, hovering(x) ? col::on_accent : col::text);
             text_x = x.x + x.w + 10;
         }
     }
@@ -2299,7 +2599,7 @@ void App::drawMessages(Rect area)
             m_r.fillRoundRect(b, 6, bg);
         // An arrow.
         float cx = b.x + b.w / 2, cy = b.y + b.h / 2;
-        Color fg = ready ? col::bright : col::faint;
+        Color fg = ready ? col::on_accent : col::faint;
         m_r.fillTriangle(cx - 7, cy - 8, cx + 9, cy, cx - 7, cy + 8, fg);
     }
 
@@ -2311,7 +2611,7 @@ void App::drawMessages(Rect area)
         for (int d = 0; d < 3; d++) {
             float phase = (float)((m_frameTime + d * 150) % 900) / 900.0f;
             float a = 0.4f + 0.6f * std::max(0.0f, std::sin(phase * 6.2832f));
-            m_r.fillCircle(input.x + 10 + d * 8, uy + 9, 2.6f, Color(220, 222, 227, (uint8_t)(a * 255)));
+            m_r.fillCircle(input.x + 10 + d * 8, uy + 9, 2.6f, Color(col::text.r, col::text.g, col::text.b, (uint8_t)(a * 255)));
         }
         typing = m_r.ellipsize(typing, 13, input.w - 120);
         m_r.drawText(input.x + 36, uy, typing, 13, col::muted);
@@ -2399,7 +2699,7 @@ void App::drawToast()
     float tw = m_r.measureText(m_toast, 15);
     Rect r{Renderer::kWidth / 2 - tw / 2 - 18, 18, tw + 36, 34};
     m_r.fillRoundRect(r, 17, m_toastOk ? Color::hex(0x248046) : col::danger);
-    m_r.drawText(r.x + 18, r.y + 7, m_toast, 15, col::bright);
+    m_r.drawText(r.x + 18, r.y + 7, m_toast, 15, col::on_accent);
 }
 
 void App::handleViewerInput(u64 down)
@@ -2464,14 +2764,15 @@ void App::drawViewer()
         float lw = m_r.measureText(label, 13);
         Rect pill{W / 2 - lw / 2 - 12, r.y + r.h - 34, lw + 24, 24};
         m_r.fillRoundRect(pill, 12, Color(0, 0, 0, 170));
-        m_r.drawText(pill.x + 12, pill.y + 4, label, 13, col::text);
+        m_r.drawText(pill.x + 12, pill.y + 4, label, 13, Color::hex(0xdcdee3));
     }
 
     std::string caption = img.name.empty() ? "Image" : img.name;
     if (m_viewerImages.size() > 1)
         caption += "   " + std::to_string(m_viewerIndex + 1) + " / " + std::to_string(m_viewerImages.size());
     caption = m_r.ellipsize(caption, kSmallSize, W / 2);
-    m_r.drawText(24, H - 34, caption, kSmallSize, col::text);
+    // The viewer is always dark, whatever the theme.
+    m_r.drawText(24, H - 34, caption, kSmallSize, Color::hex(0xdcdee3));
     std::string hint = m_mouseMode ? "(Click) Close"
                        : m_viewerImages.size() > 1 ? "(Left/Right) Previous / next   (Y) Save   (B) Close"
                                                    : "(Y) Save   (B) Close";
@@ -2479,9 +2780,9 @@ void App::drawViewer()
         Rect sb = viewerSaveRect();
         m_r.fillRoundRect(sb, 8, hovering(sb) ? col::accent_hover : col::accent);
         const char *st = m_saver.busy() ? "Saving..." : "Save";
-        m_r.drawText(sb.x + sb.w / 2 - m_r.measureText(st, 15) / 2, sb.y + 8, st, 15, col::bright);
+        m_r.drawText(sb.x + sb.w / 2 - m_r.measureText(st, 15) / 2, sb.y + 8, st, 15, col::on_accent);
     }
-    m_r.drawText(W - 24 - m_r.measureText(hint, kSmallSize), H - 34, hint, kSmallSize, col::muted);
+    m_r.drawText(W - 24 - m_r.measureText(hint, kSmallSize), H - 34, hint, kSmallSize, Color::hex(0x959ba5));
 }
 
 void App::drawHints(Rect area)
@@ -2494,8 +2795,8 @@ void App::drawHints(Rect area)
         return;
     }
     switch (m_pane) {
-    case Pane::Guilds: hints = "(A) Open   (L/R) Server   (-) Log out   (+) Exit"; break;
-    case Pane::Channels: hints = "(A) Open   (B) Back   (L/R) Server   (+) Exit"; break;
+    case Pane::Guilds: hints = "(A) Open   (L/R) Server   (-) Settings   (+) Exit"; break;
+    case Pane::Channels: hints = "(A) Open   (B) Back   (L/R) Server   (-) Settings   (+) Exit"; break;
     case Pane::Messages:
     {
         int sel = selectedIndex();

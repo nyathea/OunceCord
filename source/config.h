@@ -18,6 +18,8 @@ constexpr const char *kCookiesPath = "sdmc:/switch/OunceCord/cookies.txt";
 constexpr const char *kIdentityPath = "sdmc:/switch/OunceCord/identity.json";
 // Pictures saved from chat, which can also be sent from the picker.
 constexpr const char *kSavedDir = "sdmc:/switch/OunceCord/Saved";
+// Settings chosen in the app.
+constexpr const char *kSettingsPath = "sdmc:/switch/OunceCord/settings.json";
 
 void ensureDir();
 // The saved token, trimmed, or empty. Accepts a token with or without

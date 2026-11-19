@@ -15,6 +15,7 @@
 #include "discord/client.h"
 #include "discord/mentions.h"
 #include "discord/remoteauth.h"
+#include "settings.h"
 #include "ui/album.h"
 #include "ui/images.h"
 #include "ui/saver.h"
@@ -216,7 +217,25 @@ private:
     uint64_t m_mouseActiveAt = 0;   // last activity while engaged
     bool m_mouseDown = false, m_mouseDragged = false;
     float m_mouseStartX = 0, m_mouseStartY = 0, m_mouseLastY = 0;
-    uint64_t m_logoutArmedUntil = 0;
+    uint64_t m_logoutArmedUntil = 0;  // "press again to log out", in settings
+
+    // Settings pane, opened with (-) or the gear by the user panel.
+    Settings m_settings;
+    bool m_settingsOpen = false;
+    int m_settingsIndex = 0;
+    enum class SettingRow { Theme, Mouse, Touch, QrLogin, LogOut };
+    struct SettingItem {
+        SettingRow row;
+        Rect rect;
+    };
+    std::vector<SettingItem> settingItems() const;  // in screen space
+    Rect settingsGearRect() const;
+    Rect settingsCardRect() const;
+    void openSettings();
+    void changeSetting(SettingRow row, int dir);  // dir: -1/+1 (left/right), 0 = A/tap
+    void handleSettingsInput(u64 down);
+    void drawSettings();
+    void applySettings();  // theme etc. after a change
 
     void startClient();
     bool promptText(const char *header, const char *guide, std::string &out, Kbd kind,
