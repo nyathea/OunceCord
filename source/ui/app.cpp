@@ -38,7 +38,10 @@ constexpr float kChannelW = 248;
 constexpr float kRowH = 34;
 constexpr float kHeaderH = 48;
 constexpr float kHintsH = 30;
-constexpr float kInputH = 52;
+constexpr float kInputH = 66;  // text box plus the typing line under it
+constexpr float kInputBoxH = 40;
+// Messages: avatar radius, its centre and the text column, from the pane's left edge.
+constexpr float kMsgAvatarR = 22, kMsgAvatarX = 38, kMsgTextX = 74;
 constexpr float kUserPanelH = 56;
 
 constexpr float kTextSize = 17;
@@ -441,16 +444,94 @@ void App::composeMessage()
     Channel *ch = c.findChannel(m_openChannel);
     if (!ch || !c.canSend(*ch) || c.sendCooldownMs(*ch) > 0)
         return;
-    std::string text;
+    std::string text = m_drafts[m_openChannel];
     std::string header = "Message " + ch->label();
     if (!promptText(header.c_str(), "Type a message", text, Kbd::Message))
+        return;  // cancelled: keep the draft as it was
+    m_drafts[m_openChannel] = text;
+}
+
+bool App::canSendNow()
+{
+    Channel *ch = m_openChannel ? m_client.findChannel(m_openChannel) : nullptr;
+    return ch && m_client.canSend(*ch) && m_client.sendCooldownMs(*ch) == 0;
+}
+
+void App::sendDraft()
+{
+    if (!canSendNow())
         return;
-    // Trim trailing whitespace; skip empty messages.
+    auto it = m_drafts.find(m_openChannel);
+    if (it == m_drafts.end())
+        return;
+    std::string text = it->second;
+    // Trim surrounding whitespace; skip empty messages.
     while (!text.empty() && (text.back() == ' ' || text.back() == '\n'))
         text.pop_back();
-    if (text.empty())
+    size_t start = text.find_first_not_of(" \n");
+    if (start == std::string::npos)
         return;
-    c.sendMessage(m_openChannel, text);
+    m_client.sendMessage(m_openChannel, text.substr(start));
+    m_drafts.erase(it);
+    clearMessageSelection();
+}
+
+Rect App::inputBoxRect() const
+{
+    float x = kGuildBarW + kChannelW, w = Renderer::kWidth - x;
+    return {x + 16, Renderer::kHeight - kHintsH - kInputH + 4, w - 32, kInputBoxH};
+}
+
+Rect App::sendButtonRect() const
+{
+    Rect in = inputBoxRect();
+    return {in.x + in.w - 38, in.y + 4, 32, in.h - 8};
+}
+
+int App::selectedIndex() const
+{
+    if (!m_selActive || m_layout.empty())
+        return -1;
+    if (m_selHint < m_layout.size() && m_layout[m_selHint].id == m_selId)
+        return (int)m_selHint;
+    for (size_t i = m_layout.size(); i-- > 0;)
+        if (m_layout[i].id == m_selId)
+            return (int)i;
+    return -1;
+}
+
+void App::moveMessageSelection(int delta)
+{
+    if (m_layout.empty())
+        return;
+    int i = selectedIndex();
+    if (i < 0) {
+        if (delta > 0)
+            return;  // already following the newest messages
+        // Start from the newest message on screen.
+        i = (int)m_layout.size() - 1;
+        float bottom_from_end = m_msgScroll + 12;  // layout px below the view's bottom
+        float end = m_layoutHeight;
+        while (i > 0 && end - (m_layout[i].top + m_layout[i].height) < bottom_from_end - 1)
+            i--;
+        delta += 1;  // the first press only selects
+    }
+    i += delta;
+    if (i >= (int)m_layout.size()) {
+        clearMessageSelection();
+        return;
+    }
+    i = std::max(i, 0);
+    m_selActive = true;
+    m_selId = m_layout[i].id;
+    m_selHint = (size_t)i;
+    m_selScrollPending = true;
+}
+
+void App::clearMessageSelection()
+{
+    m_selActive = false;
+    m_selScrollPending = false;
     m_msgScroll = 0;
 }
 
@@ -535,6 +616,7 @@ void App::openChannel(Snowflake id)
         return;
     m_openChannel = id;
     m_msgScroll = 0;
+    m_selActive = false;
     m_layoutVersion = ~0u;
     m_client.loadMessages(id);
     m_client.focusChannel(id);
@@ -562,7 +644,7 @@ void App::moveSelection(int delta)
         }
         m_channelIndex = i;
     } else {
-        m_msgScroll += -delta * 60.0f;
+        moveMessageSelection(delta);
     }
 }
 
@@ -579,6 +661,11 @@ void App::activate()
                 m_pane = Pane::Messages;
             }
         }
+    } else if (int sel = selectedIndex(); sel >= 0) {
+        if (!m_layout[sel].images.empty())
+            openViewer((size_t)sel, 0);
+        else
+            composeMessage();
     } else if (!m_imageHits.empty()) {
         // The newest picture on screen.
         const ImageHit &h = m_imageHits.back();
@@ -695,15 +782,19 @@ void App::tapAt(float x, float y)
         m_pane = Pane::Messages;
         if (m_openChannel && m_msgScroll > 200 && jumpPillRect().contains(x, y))
             m_msgScroll = 0;
-        else if (y > Renderer::kHeight - kHintsH - kInputH && y < Renderer::kHeight - kHintsH)
+        else if (m_openChannel && sendButtonRect().contains(x, y))
+            sendDraft();
+        else if (m_openChannel && inputBoxRect().contains(x, y))
             composeMessage();
     }
 }
 
 void App::dragScroll(float start_x, float dy)
 {
-    if (start_x >= kGuildBarW + kChannelW)
+    if (start_x >= kGuildBarW + kChannelW) {
         m_msgScroll += dy;
+        m_selActive = false;
+    }
     else if (start_x >= kGuildBarW)
         m_channelScroll = std::max(0.0f, m_channelScroll - dy);
     else
@@ -910,7 +1001,7 @@ void App::handleInput()
             m_repeatAt = m_frameTime + 350;
             delta = (dir & HidNpadButton_AnyUp) ? -1 : 1;
         } else if (m_frameTime >= m_repeatAt) {
-            m_repeatAt = m_frameTime + (m_pane == Pane::Messages ? 30 : 70);
+            m_repeatAt = m_frameTime + (m_pane == Pane::Messages ? 90 : 70);
             delta = (dir & HidNpadButton_AnyUp) ? -1 : 1;
         }
     } else {
@@ -934,7 +1025,7 @@ void App::handleInput()
     if (down & HidNpadButton_X)
         composeMessage();
     if (down & HidNpadButton_Y && m_openChannel)
-        m_client.reloadMessages(m_openChannel);
+        sendDraft();
     // L/R jump between servers from anywhere.
     if (down & (HidNpadButton_L | HidNpadButton_R)) {
         int count = (int)m_client.guilds().size() + 1;
@@ -942,18 +1033,36 @@ void App::handleInput()
         if (m_pane == Pane::Messages)
             m_pane = Pane::Channels;
     }
-    // ZL/ZR page through messages; the right stick scrolls smoothly.
+    // ZL/ZR page through messages; the right stick moves the highlight,
+    // faster the further it's pushed.
     if (m_openChannel) {
-        if (down & HidNpadButton_ZL)
-            m_msgScroll += 400;
-        if (down & HidNpadButton_ZR)
-            m_msgScroll -= 400;
+        if (down & (HidNpadButton_ZL | HidNpadButton_ZR)) {
+            // About a screenful of messages.
+            int sel = selectedIndex();
+            int from = sel >= 0 ? sel : (int)m_layout.size();
+            int dir = (down & HidNpadButton_ZL) ? -1 : 1;
+            float covered = 0;
+            int n = 0;
+            for (int i = from + dir; i >= 0 && i < (int)m_layout.size() && covered < 400; i += dir, n++)
+                covered += m_layout[i].height;
+            if (dir > 0 && from + n >= (int)m_layout.size() - 1)
+                clearMessageSelection();
+            else if (n)
+                moveMessageSelection(dir * n + (sel < 0 ? dir : 0));
+        }
         HidAnalogStickState rs = padGetStickPos(&m_pad, 1);
         bool rs_is_wheel = (ignore & HidNpadButton_StickR) != 0;
-        if (!rs_is_wheel && std::abs(rs.y) > 6000)
-            m_msgScroll += rs.y / 32767.0f * 18.0f;
+        float push = std::abs(rs.y) / 32767.0f;
+        if (!rs_is_wheel && m_pane == Pane::Messages && push > 0.25f) {
+            if (m_frameTime >= m_stickRepeatAt) {
+                moveMessageSelection(rs.y > 0 ? -1 : 1);
+                m_stickRepeatAt = m_frameTime + (uint64_t)(260 - 220 * std::min(1.0f, (push - 0.25f) / 0.7f));
+            }
+        } else {
+            m_stickRepeatAt = 0;
+        }
         if (down & HidNpadButton_StickR)
-            m_msgScroll = 0;
+            clearMessageSelection();
     }
 }
 
@@ -1396,7 +1505,7 @@ void App::rebuildLayout(float width)
     m_layout.clear();
     m_layoutHeight = 0;
 
-    const float text_w = width - 72 - 24;
+    const float text_w = width - kMsgTextX - 24;
     const float lh = m_r.lineHeight(kTextSize);
     Snowflake prev_author = 0;
     uint64_t prev_ms = 0;
@@ -1577,9 +1686,10 @@ void App::rebuildLayout(float width)
             h += 4;
         h += L.extras.size() * (kSmallSize * 1.5f);
         h += L.show_header ? 4 : 2;
-        if (L.show_header && L.lines.empty() && L.extras.empty() && L.images.empty())
-            h += 4;
+        if (L.show_header)  // room for the avatar
+            h = std::max(h, 14 + (L.reply.empty() ? 0.0f : 20.0f) + 19 + kMsgAvatarR + 6);
         L.height = h;
+        L.top = m_layoutHeight;
         m_layoutHeight += h;
         m_layout.push_back(std::move(L));
     }
@@ -1616,6 +1726,24 @@ void App::drawMessages(Rect area)
     rebuildLayout(area.w);
 
     float max_scroll = std::max(0.0f, m_layoutHeight - view.h);
+    const int sel = selectedIndex();
+    if (m_selActive && sel < 0 && !m_layout.empty())
+        m_selActive = false;  // the message went away
+    if (sel >= 0 && m_selScrollPending) {
+        // Keep the highlighted message in view, with a margin.
+        m_selScrollPending = false;
+        const MessageLayout &S = m_layout[sel];
+        const float margin = 24;
+        // m_msgScroll is the distance from the bottom: at least min_scroll
+        // shows its top, at most max_sel_scroll shows its bottom.
+        float min_scroll = m_layoutHeight - S.top - view.h + margin;
+        float max_sel_scroll = m_layoutHeight - (S.top + S.height) - margin;
+        if (S.height + 2 * margin > view.h)
+            m_msgScroll = min_scroll;  // taller than the view: show its top
+        else
+            m_msgScroll = std::clamp(m_msgScroll, min_scroll, max_sel_scroll);
+        m_msgScroll = std::max(0.0f, m_msgScroll);
+    }
     m_msgScroll = std::clamp(m_msgScroll, 0.0f, max_scroll + (cm.reached_start ? 0 : 40));
     if (cm.loaded && !cm.loading && !cm.reached_start && m_msgScroll >= max_scroll - 300)
         m_client.loadOlder(m_openChannel);
@@ -1631,7 +1759,7 @@ void App::drawMessages(Rect area)
         m_r.drawText(view.x + 18, y - 30, "Loading...", kSmallSize, col::faint);
     }
     const float lh = m_r.lineHeight(kTextSize);
-    const float tx = view.x + 72;
+    const float tx = view.x + kMsgTextX;
     m_imageHits.clear();
     for (size_t li = 0; li < m_layout.size(); li++) {
         const MessageLayout &L = m_layout[li];
@@ -1640,6 +1768,10 @@ void App::drawMessages(Rect area)
             continue;
         }
         float cy = y;
+        if ((int)li == sel) {
+            m_r.fillRect({view.x, y, view.w, L.height}, Color(255, 255, 255, 14));
+            m_r.fillRect({view.x, y, 3, L.height}, col::accent);
+        }
         if (L.mentions_me) {
             m_r.fillRect({view.x, y, view.w, L.height}, Color(240, 177, 50, 20));
             m_r.fillRect({view.x, y, 2, L.height}, col::warn);
@@ -1652,7 +1784,7 @@ void App::drawMessages(Rect area)
                 m_r.drawText(tx, cy + 1, L.reply, 13, col::muted);
                 cy += 20;
             }
-            drawAvatar(view.x + 36, cy + 18, 18, L.author, L.author_id, L.avatar);
+            drawAvatar(view.x + kMsgAvatarX, cy + 19, kMsgAvatarR, L.author, L.author_id, L.avatar);
             float nw = m_r.drawText(tx, cy, m_r.ellipsize(L.author, kTextSize, view.w / 2), kTextSize, col::bright);
             m_r.drawText(tx + nw + 10, cy + 3, L.time, 12, col::faint);
             cy += lh;
@@ -1734,22 +1866,68 @@ void App::drawMessages(Rect area)
         m_r.drawText(pill.x + pill.w / 2 - m_r.measureText(t, 13) / 2, pill.y + 6, t, 13, col::bright);
     }
 
-    // Input bar.
-    Rect input{area.x + 16, area.y + area.h - kInputH + 4, area.w - 32, kInputH - 14};
+    // Input bar: the draft (or a placeholder) and a send button.
+    Rect input = inputBoxRect();
     bool can_send = m_client.canSend(*ch);
-    m_r.fillRoundRect(input, 8, col::bg_input);
+    m_r.fillRoundRect(input, 8, hovering(input) && !hovering(sendButtonRect()) ? col::selected : col::bg_input);
     uint64_t cooldown = can_send ? m_client.sendCooldownMs(*ch) : 0;
-    std::string placeholder = !can_send   ? "You can't send messages here."
-                              : cooldown ? "Slowmode: wait " + std::to_string(cooldown / 1000 + 1) + "s"
-                                         : "(X) Message " + title;
-    if (can_send && !cooldown && ch->rate_limit_per_user > 0)
-        placeholder += "  (slowmode " + std::to_string(ch->rate_limit_per_user) + "s)";
-    m_r.drawText(input.x + 16, input.y + 9, m_r.ellipsize(placeholder, 16, input.w - 32), 16, col::faint);
+    auto dit = m_drafts.find(m_openChannel);
+    std::string draft = dit == m_drafts.end() ? std::string() : dit->second;
+    for (auto &c : draft)
+        if (c == '\n')
+            c = ' ';
+    bool has_draft = draft.find_first_not_of(' ') != std::string::npos;
+    const float text_w = input.w - 32 - (can_send ? 40 : 0);
+    if (has_draft) {
+        // Show the end of a long draft, where the user was typing.
+        std::string shown = draft;
+        if (m_r.measureText(shown, 16) > text_w) {
+            size_t cut = 0;
+            while (cut < shown.size() && m_r.measureText(std::string_view(shown).substr(cut), 16) >
+                                             text_w - m_r.measureText("...", 16)) {
+                cut++;
+                while (cut < shown.size() && ((unsigned char)shown[cut] & 0xC0) == 0x80)
+                    cut++;
+            }
+            shown = "..." + shown.substr(cut);
+        }
+        m_r.drawText(input.x + 16, input.y + 10, shown, 16, can_send ? col::text : col::faint);
+    } else {
+        std::string placeholder = !can_send ? "You can't send messages here."
+                                  : m_mouseMode ? "Message " + title
+                                                : "(X) Message " + title;
+        if (can_send && ch->rate_limit_per_user > 0)
+            placeholder += "  (slowmode " + std::to_string(ch->rate_limit_per_user) + "s)";
+        m_r.drawText(input.x + 16, input.y + 10, m_r.ellipsize(placeholder, 16, text_w), 16, col::faint);
+    }
+    if (can_send) {
+        Rect b = sendButtonRect();
+        bool ready = has_draft && !cooldown;
+        Color bg = !ready ? Color(0, 0, 0, 0) : hovering(b) ? col::accent_hover : col::accent;
+        if (ready)
+            m_r.fillRoundRect(b, 6, bg);
+        // An arrow.
+        float cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+        Color fg = ready ? col::bright : col::faint;
+        m_r.fillTriangle(cx - 7, cy - 8, cx + 9, cy, cx - 7, cy + 8, fg);
+    }
+
+    // Under the box: who's typing, or slowmode.
+    float uy = input.y + input.h + 3;
     std::string typing = m_client.typingText(m_openChannel);
     if (!typing.empty()) {
-        typing = m_r.ellipsize(typing, 13, input.w / 2);
-        m_r.drawText(input.x + input.w - 14 - m_r.measureText(typing, 13), input.y + 11, typing, 13,
-                     col::muted);
+        // Three bouncing dots, then the names.
+        for (int d = 0; d < 3; d++) {
+            float phase = (float)((m_frameTime + d * 150) % 900) / 900.0f;
+            float a = 0.4f + 0.6f * std::max(0.0f, std::sin(phase * 6.2832f));
+            m_r.fillCircle(input.x + 10 + d * 8, uy + 9, 2.6f, Color(220, 222, 227, (uint8_t)(a * 255)));
+        }
+        typing = m_r.ellipsize(typing, 13, input.w - 120);
+        m_r.drawText(input.x + 36, uy, typing, 13, col::muted);
+    }
+    if (cooldown) {
+        std::string slow = "Slowmode: " + std::to_string(cooldown / 1000 + 1) + "s";
+        m_r.drawText(input.x + input.w - m_r.measureText(slow, 13), uy, slow, 13, col::warn);
     }
 }
 
@@ -1871,8 +2049,12 @@ void App::drawHints(Rect area)
     case Pane::Guilds: hints = "(A) Open   (L/R) Server   (-) Log out   (+) Exit"; break;
     case Pane::Channels: hints = "(A) Open   (B) Back   (L/R) Server   (+) Exit"; break;
     case Pane::Messages:
-        hints = m_imageHits.empty() ? "(X) Write   (Up/Down/RS) Scroll   (ZL/ZR) Page   (Y) Reload   (B) Back"
-                                    : "(A) View image   (X) Write   (Up/Down/RS) Scroll   (ZL/ZR) Page   (B) Back";
+    {
+        int sel = selectedIndex();
+        bool image = sel >= 0 ? !m_layout[sel].images.empty() : !m_imageHits.empty();
+        hints = std::string(image ? "(A) View image   " : "") + "(X) Write   (Y) Send   (Up/Down/RS) Select   (ZL/ZR) Page   " +
+                (sel >= 0 ? "(RS click) Latest   " : "") + "(B) Back";
+    }
         break;
     }
     m_r.drawText(area.x + area.w - 18 - m_r.measureText(hints, 13), area.y + 7, hints, 13, col::faint);

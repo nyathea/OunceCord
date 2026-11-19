@@ -4,6 +4,7 @@
 // channels, messages) driven by the controller or the touch screen.
 #pragma once
 
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -72,6 +73,7 @@ private:
         std::string avatar;  // CDN path
         bool show_header = false;
         float height = 0;
+        float top = 0;  // from the top of the whole layout
         std::string author, time;
         std::vector<std::string> lines;
         std::vector<std::pair<std::string, Color>> extras;  // reply/attachments/embeds
@@ -141,6 +143,15 @@ private:
     Snowflake m_layoutChannel = 0;
     std::vector<ImageHit> m_imageHits;    // images drawn this frame
     std::set<std::string> m_revealed;     // spoilers the user opened
+    // Unsent text per channel: the keyboard fills it, (Y) or the send button sends it.
+    std::map<Snowflake, std::string> m_drafts;
+    // The message highlighted by the stick/d-pad; none means following the
+    // newest messages.
+    bool m_selActive = false;
+    Snowflake m_selId = 0;
+    size_t m_selHint = 0;           // its last known index, for pending messages without ids
+    bool m_selScrollPending = false;  // scroll it into view on the next draw
+    uint64_t m_stickRepeatAt = 0;
 
     // Full-screen image viewer.
     bool m_viewerOpen = false;
@@ -179,7 +190,15 @@ private:
     void onAuthResult(const discord::AuthResult &r);
     void finishLogin(const std::string &token);
     void logOut(const std::string &message);
+    // Opens the keyboard on the channel's draft; it doesn't send.
     void composeMessage();
+    void sendDraft();
+    bool canSendNow();
+    Rect inputBoxRect() const;
+    Rect sendButtonRect() const;
+    int selectedIndex() const;  // into m_layout, or -1
+    void moveMessageSelection(int delta);
+    void clearMessageSelection();
 
     void handleInput();
     void handleTouch();

@@ -37,18 +37,18 @@ another client. The session is kept in `token.txt` so you stay logged in;
 
 | Button | Action |
 | --- | --- |
-| D-pad / left stick | Move selection, scroll messages |
-| A | Open server / channel; in messages, view the newest image on screen |
+| D-pad / left stick | Move selection; in chat, highlight messages one by one |
+| A | Open server / channel; in chat, view the highlighted message's image (or the newest image on screen) |
 | B | Back |
 | L / R | Previous / next server |
-| X | Write a message |
-| Right stick | Scroll messages (click to jump to latest) |
+| X | Write a message (fills the text box; press again to edit) |
+| Right stick | Highlight messages, faster the further you push (click to jump to latest) |
 | ZL / ZR | Page up / down |
-| Y | Reload messages |
+| Y | Send the message in the text box |
 | - (twice) | Log out |
 | + | Exit |
 
-Touch: tap servers and channels, drag to scroll, tap the message bar to write, tap an image to view it (or reveal a spoiler). In the viewer, left/right (or L/R) go to the previous/next image and B closes it.
+Touch: tap servers and channels, drag to scroll, tap the message bar to write and the arrow at its end to send, tap an image to view it (or reveal a spoiler). In the viewer, left/right (or L/R) go to the previous/next image and B closes it.
 
 Mouse mode: put a Joy-Con 2 on its side on a surface and slide it. A cursor
 appears; click with its L/ZL or R/ZR, hold and drag or use its stick to scroll, and press
