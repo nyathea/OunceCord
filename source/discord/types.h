@@ -169,6 +169,7 @@ struct Message {
     // Local bookkeeping for messages we sent and are waiting on.
     std::string nonce;
     bool pending = false;
+    std::string uploading;  // file being sent with a pending message
     bool failed = false;
     std::string error;  // why sending failed
 

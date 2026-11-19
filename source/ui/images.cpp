@@ -18,6 +18,7 @@
 #include "discord/cdn.h"
 #include "discord/rest.h"
 #include "net/http.h"
+#include "util/imageutil.h"
 #include "util/util.h"
 
 static constexpr const char *kCacheDir = "sdmc:/switch/OunceCord/cache";
@@ -35,6 +36,31 @@ static bool decodeJpeg(const std::string &data, std::vector<uint8_t> &out, int &
         out.resize((size_t)w * h * 4);
         ok = tjDecompress2(tj, (const unsigned char *)data.data(), (unsigned long)data.size(), out.data(), w, 0, h,
                            TJPF_RGBA, TJFLAG_ACCURATEDCT) == 0;
+    }
+    tjDestroy(tj);
+    return ok;
+}
+
+// A big JPEG decoded straight to a smaller size (libjpeg-turbo scales by
+// 1/2, 1/4 or 1/8 while decoding), for thumbnails.
+static bool decodeJpegSmall(const std::string &data, std::vector<uint8_t> &out, int &w, int &h, int max_side)
+{
+    tjhandle tj = tjInitDecompress();
+    if (!tj)
+        return false;
+    int subsamp = 0, colorspace = 0, fw = 0, fh = 0;
+    bool ok = tjDecompressHeader3(tj, (const unsigned char *)data.data(), (unsigned long)data.size(), &fw, &fh,
+                                  &subsamp, &colorspace) == 0 &&
+              fw > 0 && fh > 0 && fw <= 16384 && fh <= 16384;
+    if (ok) {
+        int scale = 1;
+        while (scale < 8 && (fw / scale > max_side || fh / scale > max_side))
+            scale *= 2;
+        w = TJSCALED(fw, (tjscalingfactor{1, scale}));
+        h = TJSCALED(fh, (tjscalingfactor{1, scale}));
+        out.resize((size_t)w * h * 4);
+        ok = tjDecompress2(tj, (const unsigned char *)data.data(), (unsigned long)data.size(), out.data(), w, 0, h,
+                           TJPF_RGBA, TJFLAG_FASTDCT) == 0;
     }
     tjDestroy(tj);
     return ok;
@@ -362,6 +388,41 @@ void ImageCache::worker()
             }
         }
 
+        if (path.compare(0, 6, "local:") == 0) {
+            std::string data;
+            std::vector<gif::Frame> frames;
+            int w = 0, h = 0;
+            bool ok = m_localLoader && m_localLoader(path, data) && decodeAny(data, frames, w, h);
+            if (!ok && !data.empty() && imageutil::sniffExtension(data) == "jpg") {
+                gif::Frame f;
+                f.delay_ms = 0;
+                ok = decodeJpegSmall(data, f.rgba, w, h, kLocalThumbSide * 2);
+                frames.clear();
+                if (ok)
+                    frames.push_back(std::move(f));
+            }
+            if (ok) {
+                // Local images are thumbnails: a still, kept small.
+                frames.resize(1);
+                frames[0].delay_ms = 0;
+                imageutil::shrink(frames[0].rgba, w, h, kLocalThumbSide);
+            }
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_entries.find(path);
+            if (it == m_entries.end())
+                continue;
+            if (ok) {
+                it->second.pending = std::move(frames);
+                it->second.next_upload = 0;
+                it->second.width = w;
+                it->second.height = h;
+                it->second.state = State::Decoded;
+            } else {
+                it->second.state = State::Failed;
+                it->second.failed_at = nowMs();
+            }
+            continue;
+        }
         std::string host = discord::cdn::kHost, req_path = path;
         if (path[0] != '/' && !discord::cdn::splitImageUrl(path, host, req_path)) {
             logf("images: refusing %s (not a Discord image host)", discord::cdn::imageCacheKey(path).c_str());

@@ -8,6 +8,8 @@ I really recommend using an alt account as 3rd party clients are against ToS and
 - Log in with your email or phone number and password, with two-factor authentication
 - Sending messages
 - Images in chat (attachments and link previews) with a full-screen viewer
+- Sending screenshots from the console's album, with or without a message
+- Saving pictures from chat to `sdmc:/switch/OunceCord/Saved`, and sending pictures from that folder (put your own JPEG, PNG or GIF files there too)
 - Custom emotes, animated ones included (large when a message is only emotes, like Discord)
 - Mentions shown as names (users, roles, channels, @everyone) plus timestamps, with messages that mention you highlighted
 - Animated GIFs, including Tenor and Giphy GIFs (fetched directly from Tenor/Giphy, since Discord only proxies those as video). Klipy GIFs show as a still for now
@@ -41,14 +43,14 @@ another client. The session is kept in `token.txt` so you stay logged in;
 | A | Open server / channel; in chat, view the highlighted message's image (or the newest image on screen) |
 | B | Back |
 | L / R | Previous / next server |
-| X | Write a message (fills the text box; press again to edit) |
+| X | Menu: write/edit the message (fills the text box), attach or remove a picture (L/R in the picker switch between Album and Saved) |
 | Right stick | Highlight messages, faster the further you push (click to jump to latest) |
 | ZL / ZR | Page up / down |
 | Y | Send the message in the text box |
 | - (twice) | Log out |
 | + | Exit |
 
-Touch: tap servers and channels, drag to scroll, tap the message bar to write and the arrow at its end to send, tap an image to view it (or reveal a spoiler). In the viewer, left/right (or L/R) go to the previous/next image and B closes it.
+Touch: tap servers and channels, drag to scroll, tap the message bar to write, the + to attach a screenshot, the x on it to remove it and the arrow to send, tap an image to view it (or reveal a spoiler). In the viewer, left/right (or L/R) go to the previous/next image, Y (or the Save button) saves it to the Saved folder, and B closes it.
 
 Mouse mode: put a Joy-Con 2 on its side on a surface and slide it. A cursor
 appears; click with its L/ZL or R/ZR, hold and drag or use its stick to scroll, and press

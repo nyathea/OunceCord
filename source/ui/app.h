@@ -15,7 +15,9 @@
 #include "discord/client.h"
 #include "discord/mentions.h"
 #include "discord/remoteauth.h"
+#include "ui/album.h"
 #include "ui/images.h"
+#include "ui/saver.h"
 #include "ui/render.h"
 #include "util/qr.h"
 
@@ -143,8 +145,44 @@ private:
     Snowflake m_layoutChannel = 0;
     std::vector<ImageHit> m_imageHits;    // images drawn this frame
     std::set<std::string> m_revealed;     // spoilers the user opened
-    // Unsent text per channel: the keyboard fills it, (Y) or the send button sends it.
-    std::map<Snowflake, std::string> m_drafts;
+    // Unsent text (and screenshot) per channel: the keyboard and the picker
+    // fill it, (Y) or the send button sends it.
+    struct Draft {
+        std::string text;
+        bool has_image = false;
+        Album::Item image;
+    };
+    std::map<Snowflake, Draft> m_drafts;
+    std::string m_composeError;  // shown under the text box for a while
+    uint64_t m_composeErrorUntil = 0;
+
+    // The (X) menu: write a message, attach or remove a screenshot.
+    enum class ComposeAction { Write, Attach, Remove };
+    bool m_composeMenuOpen = false;
+    int m_composeMenuIndex = 0;
+
+    // Screenshot picker.
+    Album m_album;
+    bool m_pickerOpen = false;
+    int m_pickerTab = 0;  // 0 album, 1 saved
+    const std::vector<Album::Item> &pickerItems() const;
+    Rect pickerTabRect(int tab) const;
+    void setPickerTab(int tab);
+    // Saving pictures from the viewer.
+    Saver m_saver;
+    Rect viewerSaveRect() const;
+    void saveViewerImage();
+    // A short message at the top of the screen.
+    std::string m_toast;
+    bool m_toastOk = true;
+    uint64_t m_toastUntil = 0;
+    void toast(const std::string &msg, bool ok = true);
+    void drawToast();
+    int m_pickerIndex = 0;
+    float m_pickerScroll = 0;
+    bool m_pickerScrollPending = false;
+    u64 m_pickerRepeatKey = 0;
+    uint64_t m_pickerRepeatAt = 0;
     // The message highlighted by the stick/d-pad; none means following the
     // newest messages.
     bool m_selActive = false;
@@ -193,6 +231,25 @@ private:
     // Opens the keyboard on the channel's draft; it doesn't send.
     void composeMessage();
     void sendDraft();
+    Draft *currentDraft();  // null when there is none
+    bool draftHasContent(const Draft *d) const;
+    Rect attachButtonRect() const;
+    Rect removeImageRect() const;  // the x on the attached screenshot
+    std::vector<ComposeAction> composeActions();
+    Rect composeMenuRect(size_t count) const;
+    void openComposeMenu();
+    void composeMenuChoose(ComposeAction a);
+    void handleComposeMenuInput(u64 down);
+    void drawComposeMenu();
+    void openPicker();
+    void pickerPick(int index);
+    void handlePickerInput(u64 down, u64 held);
+    void drawPicker();
+    // Grid geometry.
+    static constexpr int kPickerCols = 5;
+    Rect pickerGridArea() const;
+    Rect pickerCellRect(int index) const;  // in screen space, with scroll
+    int hitPicker(float x, float y) const;
     bool canSendNow();
     Rect inputBoxRect() const;
     Rect sendButtonRect() const;

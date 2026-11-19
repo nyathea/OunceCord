@@ -96,6 +96,9 @@ bool App::init()
     if (!m_r.init())
         return false;
     m_images.init();
+    m_saver.start();
+    m_images.setLocalLoader(
+        [this](const std::string &path, std::string &data) { return m_album.loadThumbnail(path, data); });
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&m_pad);
     hidInitializeTouchScreen();
@@ -127,7 +130,9 @@ void App::exit()
         padPointerExit(&m_pointer);
     m_pointerReady = false;
 #endif
+    m_saver.stop();
     m_images.exit();
+    m_album.exit();
     m_r.exit();
 }
 
@@ -444,11 +449,302 @@ void App::composeMessage()
     Channel *ch = c.findChannel(m_openChannel);
     if (!ch || !c.canSend(*ch) || c.sendCooldownMs(*ch) > 0)
         return;
-    std::string text = m_drafts[m_openChannel];
+    std::string text = m_drafts[m_openChannel].text;
     std::string header = "Message " + ch->label();
     if (!promptText(header.c_str(), "Type a message", text, Kbd::Message))
         return;  // cancelled: keep the draft as it was
-    m_drafts[m_openChannel] = text;
+    m_drafts[m_openChannel].text = text;
+}
+
+App::Draft *App::currentDraft()
+{
+    auto it = m_openChannel ? m_drafts.find(m_openChannel) : m_drafts.end();
+    return it == m_drafts.end() ? nullptr : &it->second;
+}
+
+bool App::draftHasContent(const Draft *d) const
+{
+    return d && (d->has_image || d->text.find_first_not_of(" \n") != std::string::npos);
+}
+
+Rect App::attachButtonRect() const
+{
+    Rect in = inputBoxRect();
+    return {in.x + 4, in.y + 4, 32, in.h - 8};
+}
+
+Rect App::removeImageRect() const
+{
+    Rect in = inputBoxRect();
+    return {in.x + 42 + 53 + 1, in.y + 9, 22, 22};
+}
+
+std::vector<App::ComposeAction> App::composeActions()
+{
+    std::vector<ComposeAction> a = {ComposeAction::Write, ComposeAction::Attach};
+    Draft *d = currentDraft();
+    if (d && d->has_image)
+        a.push_back(ComposeAction::Remove);
+    return a;
+}
+
+Rect App::composeMenuRect(size_t count) const
+{
+    Rect in = inputBoxRect();
+    float h = count * 44.0f + 12;
+    return {in.x, in.y - 8 - h, 280, h};
+}
+
+void App::openComposeMenu()
+{
+    if (!m_openChannel)
+        return;
+    Channel *ch = m_client.findChannel(m_openChannel);
+    if (!ch || !m_client.canSend(*ch))
+        return;
+    m_composeMenuOpen = true;
+    m_composeMenuIndex = 0;
+}
+
+void App::composeMenuChoose(ComposeAction a)
+{
+    m_composeMenuOpen = false;
+    switch (a) {
+    case ComposeAction::Write: composeMessage(); break;
+    case ComposeAction::Attach: openPicker(); break;
+    case ComposeAction::Remove:
+        if (Draft *d = currentDraft())
+            d->has_image = false;
+        break;
+    }
+}
+
+void App::handleComposeMenuInput(u64 down)
+{
+    auto actions = composeActions();
+    if (down & (HidNpadButton_B | HidNpadButton_X)) {
+        m_composeMenuOpen = false;
+        return;
+    }
+    if (down & (HidNpadButton_AnyUp))
+        m_composeMenuIndex = std::max(0, m_composeMenuIndex - 1);
+    if (down & (HidNpadButton_AnyDown))
+        m_composeMenuIndex = std::min((int)actions.size() - 1, m_composeMenuIndex + 1);
+    m_composeMenuIndex = std::clamp(m_composeMenuIndex, 0, (int)actions.size() - 1);
+    if (down & HidNpadButton_A)
+        composeMenuChoose(actions[m_composeMenuIndex]);
+}
+
+void App::drawComposeMenu()
+{
+    auto actions = composeActions();
+    Rect r = composeMenuRect(actions.size());
+    m_r.fillRoundRect({r.x - 1, r.y - 1, r.w + 2, r.h + 2}, 9, col::bg_guilds);
+    m_r.fillRoundRect(r, 8, col::bg_panel);
+    Draft *d = currentDraft();
+    for (size_t i = 0; i < actions.size(); i++) {
+        Rect it{r.x + 6, r.y + 6 + i * 44.0f, r.w - 12, 44};
+        bool focus = m_mouseMode ? hovering(it) : (int)i == m_composeMenuIndex;
+        if (focus)
+            m_r.fillRoundRect(it, 6, actions[i] == ComposeAction::Remove ? col::danger : col::accent);
+        const char *label = actions[i] == ComposeAction::Write    ? (d && !d->text.empty() ? "Edit message" : "Write a message")
+                            : actions[i] == ComposeAction::Attach ? (d && d->has_image ? "Change picture" : "Attach a picture")
+                                                                  : "Remove picture";
+        Color fg = focus ? col::bright : actions[i] == ComposeAction::Remove ? col::danger : col::text;
+        m_r.drawText(it.x + 14, it.y + 12, label, 16, fg);
+    }
+}
+
+const std::vector<Album::Item> &App::pickerItems() const
+{
+    return m_pickerTab ? m_album.saved() : m_album.items();
+}
+
+Rect App::pickerTabRect(int tab) const
+{
+    return {Renderer::kWidth - 40 - 260 + tab * 132.0f, 20, 128, 34};
+}
+
+void App::setPickerTab(int tab)
+{
+    if (tab == m_pickerTab)
+        return;
+    m_pickerTab = tab;
+    m_pickerIndex = 0;
+    m_pickerScroll = 0;
+    if (tab)
+        m_album.refreshSaved();
+    else
+        m_album.refresh();
+}
+
+void App::openPicker()
+{
+    if (m_pickerTab)
+        m_album.refreshSaved();
+    else
+        m_album.refresh();
+    m_pickerOpen = true;
+    m_pickerIndex = 0;
+    m_pickerScroll = 0;
+    m_pickerRepeatKey = 0;
+}
+
+void App::pickerPick(int index)
+{
+    const auto &items = pickerItems();
+    if (index < 0 || (size_t)index >= items.size() || !m_openChannel)
+        return;
+    Draft &d = m_drafts[m_openChannel];
+    d.has_image = true;
+    d.image = items[index];
+    m_pickerOpen = false;
+}
+
+Rect App::pickerGridArea() const
+{
+    return {40, 72, Renderer::kWidth - 80, Renderer::kHeight - 72 - 44};
+}
+
+Rect App::pickerCellRect(int index) const
+{
+    Rect g = pickerGridArea();
+    const float gap = 12;
+    float w = (g.w - gap * (kPickerCols - 1)) / kPickerCols, h = w * 9 / 16;
+    float row_h = h + 30;
+    int row = index / kPickerCols, col_i = index % kPickerCols;
+    return {g.x + col_i * (w + gap), g.y + row * row_h - m_pickerScroll, w, h};
+}
+
+int App::hitPicker(float x, float y) const
+{
+    Rect g = pickerGridArea();
+    if (!g.contains(x, y))
+        return -1;
+    for (size_t i = 0; i < pickerItems().size(); i++) {
+        Rect r = pickerCellRect((int)i);
+        if (r.y > g.y + g.h)
+            break;
+        if (r.contains(x, y))
+            return (int)i;
+    }
+    return -1;
+}
+
+void App::handlePickerInput(u64 down, u64 held)
+{
+    if (down & HidNpadButton_B) {
+        m_pickerOpen = false;
+        return;
+    }
+    if (down & (HidNpadButton_L | HidNpadButton_R)) {
+        setPickerTab((down & HidNpadButton_R) ? 1 : 0);
+        return;
+    }
+    int count = (int)pickerItems().size();
+    if (down & HidNpadButton_A) {
+        pickerPick(m_pickerIndex);
+        return;
+    }
+    if (!count)
+        return;
+    // Four directions with key repeat.
+    const u64 kDirs = HidNpadButton_AnyUp | HidNpadButton_AnyDown | HidNpadButton_AnyLeft | HidNpadButton_AnyRight;
+    u64 dir = held & kDirs;
+    bool step = false;
+    if (dir && dir != m_pickerRepeatKey) {
+        m_pickerRepeatKey = dir;
+        m_pickerRepeatAt = m_frameTime + 350;
+        step = true;
+    } else if (dir && m_frameTime >= m_pickerRepeatAt) {
+        m_pickerRepeatAt = m_frameTime + 90;
+        step = true;
+    } else if (!dir) {
+        m_pickerRepeatKey = 0;
+    }
+    int i = m_pickerIndex;
+    if (step) {
+        if (dir & HidNpadButton_AnyLeft)
+            i -= 1;
+        else if (dir & HidNpadButton_AnyRight)
+            i += 1;
+        else if (dir & HidNpadButton_AnyUp)
+            i -= kPickerCols;
+        else if (dir & HidNpadButton_AnyDown)
+            i += kPickerCols;
+    }
+    if (down & HidNpadButton_ZL)
+        i -= kPickerCols * 3;
+    if (down & HidNpadButton_ZR)
+        i += kPickerCols * 3;
+    i = std::clamp(i, 0, count - 1);
+    if (i != m_pickerIndex) {
+        m_pickerIndex = i;
+        m_pickerScrollPending = true;
+    }
+}
+
+void App::drawPicker()
+{
+    const float W = Renderer::kWidth, H = Renderer::kHeight;
+    m_r.fillRect({0, 0, W, H}, Color(17, 18, 20, 245));
+    m_r.drawText(40, 24, m_pickerTab ? "Attach a saved picture" : "Attach a screenshot", 22, col::bright);
+    for (int t = 0; t < 2; t++) {
+        Rect tr = pickerTabRect(t);
+        bool on = t == m_pickerTab;
+        m_r.fillRoundRect(tr, 8, on ? col::accent : hovering(tr) ? col::hover : col::bg_input);
+        std::string label = std::string(t == 0 ? "Album" : "Saved");
+        if (!m_mouseMode)
+            label = (t == 0 ? "(L) " : "(R) ") + label;
+        m_r.drawText(tr.x + tr.w / 2 - m_r.measureText(label, 15) / 2, tr.y + 7, label, 15,
+                     on ? col::bright : col::text);
+    }
+    const auto &items = pickerItems();
+    Rect g = pickerGridArea();
+    if (items.empty()) {
+        const std::string &msg = m_pickerTab ? m_album.savedError() : m_album.error();
+        m_r.drawText(W / 2 - m_r.measureText(msg, 17) / 2, H / 2 - 12, msg, 17, col::muted);
+    } else {
+        // Clamp the scroll, and keep the focused cell in view.
+        Rect first = pickerCellRect(0);
+        float row_h = first.h + 30;
+        int rows = ((int)items.size() + kPickerCols - 1) / kPickerCols;
+        float max_scroll = std::max(0.0f, rows * row_h - g.h);
+        if (m_pickerScrollPending) {
+            m_pickerScrollPending = false;
+            float top = (m_pickerIndex / kPickerCols) * row_h;
+            if (top < m_pickerScroll)
+                m_pickerScroll = top;
+            if (top + row_h > m_pickerScroll + g.h)
+                m_pickerScroll = top + row_h - g.h;
+        }
+        m_pickerScroll = std::clamp(m_pickerScroll, 0.0f, max_scroll);
+
+        m_r.pushClip(g);
+        for (size_t i = 0; i < items.size(); i++) {
+            Rect r = pickerCellRect((int)i);
+            if (r.y + r.h + 30 < g.y)
+                continue;
+            if (r.y > g.y + g.h)
+                break;
+            bool focus = m_mouseMode ? hovering(r) : (int)i == m_pickerIndex;
+            if (focus)
+                m_r.fillRoundRect({r.x - 4, r.y - 4, r.w + 8, r.h + 8}, 9, col::accent);
+            bool failed = false;
+            if (GLuint tex = m_images.get(items[i].key, &failed))
+                m_r.drawImage(tex, r, Shape::Rounded);
+            else {
+                m_r.fillRoundRect(r, 6, col::bg_input);
+                const char *t = failed ? "Can't load" : "";
+                m_r.drawText(r.x + r.w / 2 - m_r.measureText(t, 13) / 2, r.y + r.h / 2 - 9, t, 13, col::faint);
+            }
+            std::string label = m_r.ellipsize(items[i].label(), 13, r.w - 4);
+            m_r.drawText(r.x + 2, r.y + r.h + 7, label, 13, focus ? col::bright : col::muted);
+        }
+        m_r.popClip();
+    }
+    const char *hints = m_mouseMode ? "Click a screenshot to attach it" : "(A) Attach   (L/R) Album / Saved   (ZL/ZR) Page   (B) Cancel";
+    m_r.drawText(W - 40 - m_r.measureText(hints, 13), H - 30, hints, 13, col::faint);
 }
 
 bool App::canSendNow()
@@ -462,16 +758,31 @@ void App::sendDraft()
     if (!canSendNow())
         return;
     auto it = m_drafts.find(m_openChannel);
-    if (it == m_drafts.end())
+    if (it == m_drafts.end() || !draftHasContent(&it->second))
         return;
-    std::string text = it->second;
-    // Trim surrounding whitespace; skip empty messages.
+    std::string text = it->second.text;
+    // Trim surrounding whitespace.
     while (!text.empty() && (text.back() == ' ' || text.back() == '\n'))
         text.pop_back();
     size_t start = text.find_first_not_of(" \n");
-    if (start == std::string::npos)
-        return;
-    m_client.sendMessage(m_openChannel, text.substr(start));
+    text = start == std::string::npos ? std::string() : text.substr(start);
+    if (it->second.has_image) {
+        discord::Upload up;
+        up.filename = it->second.image.uploadName();
+        up.content_type = it->second.image.contentType();
+        std::string error;
+        if (!m_album.loadFile(it->second.image, up.data, error)) {
+            // Keep the draft so nothing typed is lost.
+            m_composeError = error;
+            m_composeErrorUntil = m_frameTime + 5000;
+            return;
+        }
+        m_client.sendMessage(m_openChannel, text, &up);
+    } else {
+        if (text.empty())
+            return;
+        m_client.sendMessage(m_openChannel, text);
+    }
     m_drafts.erase(it);
     clearMessageSelection();
 }
@@ -733,7 +1044,32 @@ bool App::hovering(Rect r) const
 void App::tapAt(float x, float y)
 {
     if (m_viewerOpen) {
-        m_viewerOpen = false;
+        if (viewerSaveRect().contains(x, y))
+            saveViewerImage();
+        else
+            m_viewerOpen = false;
+        return;
+    }
+    if (m_pickerOpen) {
+        for (int t = 0; t < 2; t++)
+            if (pickerTabRect(t).contains(x, y)) {
+                setPickerTab(t);
+                return;
+            }
+        int i = hitPicker(x, y);
+        if (i >= 0)
+            pickerPick(i);
+        else if (y < pickerGridArea().y)
+            m_pickerOpen = false;  // tapping the title bar cancels
+        return;
+    }
+    if (m_composeMenuOpen) {
+        auto actions = composeActions();
+        Rect r = composeMenuRect(actions.size());
+        m_composeMenuOpen = false;
+        for (size_t i = 0; i < actions.size(); i++)
+            if (Rect{r.x + 6, r.y + 6 + i * 44.0f, r.w - 12, 44}.contains(x, y))
+                composeMenuChoose(actions[i]);
         return;
     }
     if (m_screen == Screen::Main) {
@@ -784,6 +1120,10 @@ void App::tapAt(float x, float y)
             m_msgScroll = 0;
         else if (m_openChannel && sendButtonRect().contains(x, y))
             sendDraft();
+        else if (m_openChannel && attachButtonRect().contains(x, y))
+            openComposeMenu();
+        else if (m_openChannel && currentDraft() && currentDraft()->has_image && removeImageRect().contains(x, y))
+            currentDraft()->has_image = false;
         else if (m_openChannel && inputBoxRect().contains(x, y))
             composeMessage();
     }
@@ -791,6 +1131,10 @@ void App::tapAt(float x, float y)
 
 void App::dragScroll(float start_x, float dy)
 {
+    if (m_pickerOpen) {
+        m_pickerScroll -= dy;
+        return;
+    }
     if (start_x >= kGuildBarW + kChannelW) {
         m_msgScroll += dy;
         m_selActive = false;
@@ -975,6 +1319,14 @@ void App::handleInput()
         handleViewerInput(down);
         return;
     }
+    if (m_pickerOpen) {
+        handlePickerInput(down, held);
+        return;
+    }
+    if (m_composeMenuOpen) {
+        handleComposeMenuInput(down);
+        return;
+    }
 
     // A rejected session sends us back to the login screen.
     if (m_client.status() == discord::GatewayStatus::AuthFailed) {
@@ -1022,8 +1374,8 @@ void App::handleInput()
         activate();
     if (down & HidNpadButton_B)
         back();
-    if (down & HidNpadButton_X)
-        composeMessage();
+    if (down & HidNpadButton_X && m_pane != Pane::Guilds)
+        openComposeMenu();
     if (down & HidNpadButton_Y && m_openChannel)
         sendDraft();
     // L/R jump between servers from anywhere.
@@ -1073,6 +1425,12 @@ bool App::frame()
     m_frameTime = nowMs();
     m_client.update();
     m_auth.update();
+    {
+        std::string msg;
+        bool ok = true;
+        while (m_saver.takeResult(msg, ok))
+            toast(msg, ok);
+    }
     if (kQrLogin && m_screen == Screen::Login) {
         if (!m_remoteStarted) {
             m_remote.start();
@@ -1286,8 +1644,13 @@ void App::drawMain()
                          kSmallSize, col::muted);
         }
     }
+    if (m_composeMenuOpen)
+        drawComposeMenu();
+    if (m_pickerOpen)
+        drawPicker();
     if (m_viewerOpen)
         drawViewer();
+    drawToast();
 }
 
 void App::drawAvatar(float cx, float cy, float radius, const std::string &name, Snowflake id,
@@ -1671,6 +2034,9 @@ void App::rebuildLayout(float width)
                     c = ' ';
             L.extras.push_back({m_r.ellipsize(e, kSmallSize, text_w), col::muted});
         }
+        if (!m.uploading.empty())
+            L.extras.push_back({(m.pending ? "Uploading " : "Not sent: ") + m.uploading + (m.pending ? "..." : ""),
+                                m.pending ? col::muted : col::danger});
         if (m.failed)
             L.extras.push_back({m.error.empty() ? "Failed to send." : "Failed to send: " + m.error, col::danger});
 
@@ -1869,16 +2235,40 @@ void App::drawMessages(Rect area)
     // Input bar: the draft (or a placeholder) and a send button.
     Rect input = inputBoxRect();
     bool can_send = m_client.canSend(*ch);
-    m_r.fillRoundRect(input, 8, hovering(input) && !hovering(sendButtonRect()) ? col::selected : col::bg_input);
+    m_r.fillRoundRect(input, 8, col::bg_input);
     uint64_t cooldown = can_send ? m_client.sendCooldownMs(*ch) : 0;
-    auto dit = m_drafts.find(m_openChannel);
-    std::string draft = dit == m_drafts.end() ? std::string() : dit->second;
+    Draft *dr = currentDraft();
+    std::string draft = dr ? dr->text : std::string();
     for (auto &c : draft)
         if (c == '\n')
             c = ' ';
-    bool has_draft = draft.find_first_not_of(' ') != std::string::npos;
-    const float text_w = input.w - 32 - (can_send ? 40 : 0);
-    if (has_draft) {
+    bool has_text = draft.find_first_not_of(' ') != std::string::npos;
+    bool has_draft = draftHasContent(dr);
+    // Left: a "+" for attaching, then the attached screenshot with an x.
+    float text_x = input.x + 16;
+    if (can_send) {
+        Rect a = attachButtonRect();
+        float cx = a.x + a.w / 2, cy = a.y + a.h / 2;
+        m_r.fillCircle(cx, cy, 11, hovering(a) ? col::bright : col::muted);
+        m_r.fillRect({cx - 5.5f, cy - 1, 11, 2}, col::bg_input);
+        m_r.fillRect({cx - 1, cy - 5.5f, 2, 11}, col::bg_input);
+        text_x = a.x + a.w + 8;
+        if (dr && dr->has_image) {
+            Rect t{input.x + 42, input.y + 5, 53, 30};
+            if (GLuint tex = m_images.get(dr->image.key))
+                m_r.drawImage(tex, t, Shape::Rounded);
+            else
+                m_r.fillRoundRect(t, 4, col::selected);
+            Rect x = removeImageRect();
+            float xc = x.x + x.w / 2, yc = x.y + x.h / 2;
+            m_r.fillCircle(xc, yc, 9, hovering(x) ? col::danger : col::selected);
+            const char *times = "\xC3\x97";  // U+00D7
+            m_r.drawText(xc - m_r.measureText(times, 15) / 2, yc - 10, times, 15, col::bright);
+            text_x = x.x + x.w + 10;
+        }
+    }
+    const float text_w = input.x + input.w - 16 - (can_send ? 40 : 0) - text_x;
+    if (has_text) {
         // Show the end of a long draft, where the user was typing.
         std::string shown = draft;
         if (m_r.measureText(shown, 16) > text_w) {
@@ -1891,14 +2281,15 @@ void App::drawMessages(Rect area)
             }
             shown = "..." + shown.substr(cut);
         }
-        m_r.drawText(input.x + 16, input.y + 10, shown, 16, can_send ? col::text : col::faint);
+        m_r.drawText(text_x, input.y + 10, shown, 16, can_send ? col::text : col::faint);
     } else {
-        std::string placeholder = !can_send ? "You can't send messages here."
-                                  : m_mouseMode ? "Message " + title
-                                                : "(X) Message " + title;
+        std::string placeholder = !can_send          ? "You can't send messages here."
+                                  : has_draft      ? (m_mouseMode ? "Add a message" : "(X) Add a message")
+                                  : m_mouseMode    ? "Message " + title
+                                                   : "(X) Message " + title;
         if (can_send && ch->rate_limit_per_user > 0)
             placeholder += "  (slowmode " + std::to_string(ch->rate_limit_per_user) + "s)";
-        m_r.drawText(input.x + 16, input.y + 10, m_r.ellipsize(placeholder, 16, text_w), 16, col::faint);
+        m_r.drawText(text_x, input.y + 10, m_r.ellipsize(placeholder, 16, text_w), 16, col::faint);
     }
     if (can_send) {
         Rect b = sendButtonRect();
@@ -1924,6 +2315,10 @@ void App::drawMessages(Rect area)
         }
         typing = m_r.ellipsize(typing, 13, input.w - 120);
         m_r.drawText(input.x + 36, uy, typing, 13, col::muted);
+    }
+    if (!m_composeError.empty() && m_frameTime < m_composeErrorUntil) {
+        std::string e = m_r.ellipsize(m_composeError, 13, input.w / 2);
+        m_r.drawText(input.x + input.w / 2 - m_r.measureText(e, 13) / 2, uy, e, 13, col::danger);
     }
     if (cooldown) {
         std::string slow = "Slowmode: " + std::to_string(cooldown / 1000 + 1) + "s";
@@ -1965,8 +2360,54 @@ void App::openViewer(size_t layout, size_t image)
     m_viewerOpen = true;
 }
 
+Rect App::viewerSaveRect() const
+{
+    return {Renderer::kWidth - 24 - 120, 20, 120, 36};
+}
+
+void App::saveViewerImage()
+{
+    if (m_viewerIndex >= m_viewerImages.size())
+        return;
+    const ImageBlock &img = m_viewerImages[m_viewerIndex];
+    if (img.spoiler && !m_revealed.count(img.source))
+        return;
+    // The GIF itself for Tenor/Giphy; otherwise the full-size original.
+    std::string url = !img.animated.empty() ? img.animated : img.source;
+    std::string name = img.name;
+    if (name.empty()) {
+        // The last part of the URL's path.
+        std::string p = url.substr(0, url.find('?'));
+        size_t slash = p.rfind('/');
+        name = slash == std::string::npos ? p : p.substr(slash + 1);
+    }
+    m_saver.save(url, name);
+    toast("Saving...");
+}
+
+void App::toast(const std::string &msg, bool ok)
+{
+    m_toast = msg;
+    m_toastOk = ok;
+    m_toastUntil = m_frameTime + (ok ? 2500 : 4000);
+}
+
+void App::drawToast()
+{
+    if (m_toast.empty() || m_frameTime >= m_toastUntil)
+        return;
+    float tw = m_r.measureText(m_toast, 15);
+    Rect r{Renderer::kWidth / 2 - tw / 2 - 18, 18, tw + 36, 34};
+    m_r.fillRoundRect(r, 17, m_toastOk ? Color::hex(0x248046) : col::danger);
+    m_r.drawText(r.x + 18, r.y + 7, m_toast, 15, col::bright);
+}
+
 void App::handleViewerInput(u64 down)
 {
+    if (down & HidNpadButton_Y) {
+        saveViewerImage();
+        return;
+    }
     if (down & (HidNpadButton_B | HidNpadButton_A)) {
         m_viewerOpen = false;
         return;
@@ -2031,8 +2472,15 @@ void App::drawViewer()
         caption += "   " + std::to_string(m_viewerIndex + 1) + " / " + std::to_string(m_viewerImages.size());
     caption = m_r.ellipsize(caption, kSmallSize, W / 2);
     m_r.drawText(24, H - 34, caption, kSmallSize, col::text);
-    std::string hint = m_mouseMode ? "(Click) Close" : m_viewerImages.size() > 1 ? "(Left/Right) Previous / next   (B) Close"
-                                                                                : "(B) Close";
+    std::string hint = m_mouseMode ? "(Click) Close"
+                       : m_viewerImages.size() > 1 ? "(Left/Right) Previous / next   (Y) Save   (B) Close"
+                                                   : "(Y) Save   (B) Close";
+    if (!(img.spoiler && !m_revealed.count(img.source))) {
+        Rect sb = viewerSaveRect();
+        m_r.fillRoundRect(sb, 8, hovering(sb) ? col::accent_hover : col::accent);
+        const char *st = m_saver.busy() ? "Saving..." : "Save";
+        m_r.drawText(sb.x + sb.w / 2 - m_r.measureText(st, 15) / 2, sb.y + 8, st, 15, col::bright);
+    }
     m_r.drawText(W - 24 - m_r.measureText(hint, kSmallSize), H - 34, hint, kSmallSize, col::muted);
 }
 
@@ -2052,7 +2500,7 @@ void App::drawHints(Rect area)
     {
         int sel = selectedIndex();
         bool image = sel >= 0 ? !m_layout[sel].images.empty() : !m_imageHits.empty();
-        hints = std::string(image ? "(A) View image   " : "") + "(X) Write   (Y) Send   (Up/Down/RS) Select   (ZL/ZR) Page   " +
+        hints = std::string(image ? "(A) View image   " : "") + "(X) Write/attach   (Y) Send   (Up/Down/RS) Select   (ZL/ZR) Page   " +
                 (sel >= 0 ? "(RS click) Latest   " : "") + "(B) Back";
     }
         break;

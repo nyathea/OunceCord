@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -41,6 +42,7 @@ public:
     static constexpr uint64_t kFailRetryMs = 5 * 60 * 1000;
     static constexpr int kUploadsPerFrame = 6;
     static constexpr size_t kMaxDiskFiles = 5000;
+    static constexpr int kLocalThumbSide = 480;  // "local:" images are shrunk to this
 
     bool init();
     void exit();
@@ -52,6 +54,11 @@ public:
     GLuint get(const std::string &path, bool *failed = nullptr);
     // Uploads finished images. Call once per frame on the GL thread.
     void update();
+    // Paths starting with "local:" are read with this (on a worker thread)
+    // instead of downloaded, and never cached on disk. They are thumbnails:
+    // only the first frame is kept, at most kLocalThumbSide across.
+    using LocalLoader = std::function<bool(const std::string &path, std::string &data)>;
+    void setLocalLoader(LocalLoader loader) { m_localLoader = std::move(loader); }
 
 private:
     enum class State { Queued, Loading, Decoded, Ready, Failed };
@@ -78,6 +85,8 @@ private:
     std::atomic<bool> m_running{false};
     size_t m_textureCount = 0;
     size_t m_textureBytes = 0;
+
+    LocalLoader m_localLoader;
 
     void worker();
     // Picks the most recently requested queued path. Called with the lock held.

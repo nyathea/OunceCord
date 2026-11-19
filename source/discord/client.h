@@ -16,6 +16,7 @@
 #include "discord/gateway.h"
 #include "discord/rest.h"
 #include "discord/types.h"
+#include "discord/upload.h"
 
 namespace discord {
 
@@ -63,7 +64,8 @@ public:
     void reloadMessages(Snowflake channel_id);
     // Milliseconds until slowmode lets us send in this channel (0 = now).
     uint64_t sendCooldownMs(const Channel &c);
-    void sendMessage(Snowflake channel_id, const std::string &content);
+    // Sends a message, with a file when upload is given (content may then be empty).
+    void sendMessage(Snowflake channel_id, const std::string &content, const Upload *upload = nullptr);
     // Marks a channel as being viewed: subscribes to its guild's events.
     void focusChannel(Snowflake channel_id);
     std::string typingText(Snowflake channel_id);

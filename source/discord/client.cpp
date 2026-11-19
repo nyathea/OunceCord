@@ -531,9 +531,9 @@ void Client::loadOlder(Snowflake channel_id)
                    });
 }
 
-void Client::sendMessage(Snowflake channel_id, const std::string &content)
+void Client::sendMessage(Snowflake channel_id, const std::string &content, const Upload *upload)
 {
-    if (content.empty())
+    if (content.empty() && !upload)
         return;
     if (Channel *c = findChannel(channel_id)) {
         if (sendCooldownMs(*c) > 0)
@@ -556,6 +556,8 @@ void Client::sendMessage(Snowflake channel_id, const std::string &content)
     pending.content = content;
     pending.nonce = nonce;
     pending.pending = true;
+    if (upload)
+        pending.uploading = upload->filename;
     cm.messages.push_back(pending);
     m_messagesVersion++;
 
@@ -565,10 +567,27 @@ void Client::sendMessage(Snowflake channel_id, const std::string &content)
     body.set("tts", json::Value::boolean(false));
     body.set("flags", json::Value::number((int64_t)0));
     body.set("mobile_network_type", json::Value::string("unknown"));
+    std::string request_body;
+    HttpHeaders extra = {{"X-Context-Properties", base64Encode(std::string("{\"location\":\"chat_input\"}"))}};
+    if (upload) {
+        json::Value att = json::Value::object();
+        att.set("id", json::Value::string("0"));
+        att.set("filename", json::Value::string(safeFilename(upload->filename)));
+        json::Value list = json::Value::array();
+        list.push(std::move(att));
+        body.set("attachments", std::move(list));
+        unsigned char rnd[16];
+        randomBytes(rnd, sizeof(rnd));
+        std::string boundary = multipartBoundary(rnd);
+        request_body = multipartBody(boundary, body.dump(), *upload);
+        extra.emplace_back("Content-Type", "multipart/form-data; boundary=" + boundary);
+    } else {
+        request_body = body.dump();
+    }
 
     std::weak_ptr<bool> alive = m_alive;
     m_rest.request(
-        "POST", "/channels/" + std::to_string(channel_id) + "/messages", body.dump(),
+        "POST", "/channels/" + std::to_string(channel_id) + "/messages", std::move(request_body),
         [this, alive, channel_id, nonce](const HttpResponse &res) {
             if (alive.expired())
                 return;
@@ -601,7 +620,7 @@ void Client::sendMessage(Snowflake channel_id, const std::string &content)
                 break;
             }
         },
-        {{"X-Context-Properties", base64Encode(std::string("{\"location\":\"chat_input\"}"))}});
+        std::move(extra));
 }
 
 void Client::focusChannel(Snowflake channel_id)

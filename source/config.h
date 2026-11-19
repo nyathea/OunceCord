@@ -16,6 +16,8 @@ constexpr const char *kFingerprintPath = "sdmc:/switch/OunceCord/fingerprint.txt
 constexpr const char *kCookiesPath = "sdmc:/switch/OunceCord/cookies.txt";
 // Optional overrides for the client identity (build numbers, versions).
 constexpr const char *kIdentityPath = "sdmc:/switch/OunceCord/identity.json";
+// Pictures saved from chat, which can also be sent from the picker.
+constexpr const char *kSavedDir = "sdmc:/switch/OunceCord/Saved";
 
 void ensureDir();
 // The saved token, trimmed, or empty. Accepts a token with or without

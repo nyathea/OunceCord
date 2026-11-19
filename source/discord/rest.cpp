@@ -244,7 +244,9 @@ void RestWorker::run()
         }
 
         HttpHeaders headers = Identity::get().restHeaders(token);
-        if (!job.body.empty())
+        bool typed = std::any_of(job.extra.begin(), job.extra.end(),
+                                 [](const auto &h) { return h.first == "Content-Type"; });
+        if (!job.body.empty() && !typed)
             headers.emplace_back("Content-Type", "application/json");
         for (auto &h : job.extra)
             headers.push_back(h);
