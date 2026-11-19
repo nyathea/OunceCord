@@ -41,7 +41,7 @@ include $(DEVKITPRO)/libounce/switch2_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	OunceCord
 BUILD		:=	build
-SOURCES		:=	source source/net source/discord source/ui source/util
+SOURCES		:=	source source/net source/discord source/media source/ui source/util
 DATA		:=	data
 INCLUDES	:=	source
 APP_TITLE	:=	OunceCord

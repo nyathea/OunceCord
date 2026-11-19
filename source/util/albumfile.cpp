@@ -25,7 +25,14 @@ std::string Date::fileName() const
     return buf;
 }
 
-bool parseFileName(std::string_view name, Date &out)
+std::string Date::videoFileName() const
+{
+    char buf[48];
+    snprintf(buf, sizeof(buf), "clip-%04d-%02d-%02d-%02d%02d%02d.mp4", year, month, day, hour, minute, second);
+    return buf;
+}
+
+bool parseFileName(std::string_view name, Date &out, bool *video)
 {
     if (name.size() < 20)
         return false;
@@ -35,8 +42,11 @@ bool parseFileName(std::string_view name, Date &out)
     if (name[16] != '-')
         return false;
     std::string_view ext = name.substr(name.size() - 4);
-    if (ext != ".jpg" && ext != ".JPG")
+    bool is_video = ext == ".mp4" || ext == ".MP4";
+    if (ext != ".jpg" && ext != ".JPG" && !is_video)
         return false;
+    if (video)
+        *video = is_video;
     auto num = [&](int at, int len) {
         int v = 0;
         for (int i = 0; i < len; i++)

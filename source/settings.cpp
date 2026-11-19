@@ -20,6 +20,7 @@ std::string Settings::toJson() const
     v.set("mouse", json::Value::boolean(mouse));
     v.set("touch", json::Value::boolean(touch));
     v.set("qr_login", json::Value::boolean(qr_login));
+    v.set("videos", json::Value::boolean(videos));
     return v.dump();
 }
 
@@ -40,6 +41,8 @@ Settings Settings::fromJson(const std::string &text)
         s.touch = v["touch"].asBool();
     if (v["qr_login"].isBool())
         s.qr_login = v["qr_login"].asBool();
+    if (v["videos"].isBool())
+        s.videos = v["videos"].asBool();
     return s;
 }
 

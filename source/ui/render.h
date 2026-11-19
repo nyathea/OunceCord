@@ -66,6 +66,19 @@ public:
     float measureText(std::string_view text, float size);
     float lineHeight(float size) const { return size * 1.3f; }
     float ascent(float size) const { return size * 0.95f; }
+    // Semibold and/or italic text (built-in gg sans) for the drawing and
+    // measuring done while one of these is alive; characters those faces
+    // lack fall back to the regular chain.
+    enum StyleBits { kBold = 1, kItalic = 2 };
+    struct Style {
+        Style(Renderer &r, int bits) : m_r(r), m_prev(r.m_style) { r.m_style = bits & 3; }
+        ~Style() { m_r.m_style = m_prev; }
+        Renderer &m_r;
+        int m_prev;
+    };
+    struct Bold : Style {
+        explicit Bold(Renderer &r, bool on = true) : Style(r, on ? kBold : 0) {}
+    };
     // Word-wraps text to width. Explicit newlines are kept.
     std::vector<std::string> wrapText(std::string_view text, float size, float width);
     // Truncates with an ellipsis to fit width.
@@ -74,6 +87,8 @@ public:
     // Draws an RGBA texture into r, masked to a circle or a squircle
     // (superellipse) with an antialiased edge.
     void drawImage(GLuint tex, Rect r, Shape shape, Color tint = Color(255, 255, 255));
+    // Draws a video frame from NV12 textures (R8 luma, RG8 chroma at half size).
+    void drawNv12(GLuint y_tex, GLuint uv_tex, Rect r, bool bt709);
     // Fills r with a solid colour in the given shape.
     void fillShape(Rect r, Shape shape, Color c);
 
@@ -105,6 +120,8 @@ private:
     GLuint m_imageProgram = 0;
     GLint m_uImgScreen = -1, m_uImgRect = -1, m_uImgShape = -1, m_uImgRadius = -1;
     GLuint m_whiteTex = 0;
+    GLuint m_nv12Program = 0;
+    GLint m_uNvScreen = -1, m_uNvBt709 = -1;
     std::vector<Vertex> m_verts;
     std::vector<Rect> m_clips;
 
@@ -118,6 +135,9 @@ private:
 
     FT_Library m_ft = nullptr;
     std::vector<FT_Face> m_faces;  // fallback chain
+    FT_Face m_styleFaces[4] = {};  // by StyleBits: [1] semibold, [2] italic, [3] both
+    int m_style = 0;
+    bool loadMemoryFace(const void *data, size_t size, FT_Face &face);
     std::vector<std::vector<uint8_t>> m_fontData;
 
     bool initFonts();

@@ -35,6 +35,10 @@ std::string contentTypeForName(std::string_view name)
         return "image/gif";
     if (ext == "webp")
         return "image/webp";
+    if (ext == "mp4" || ext == "m4v")
+        return "video/mp4";
+    if (ext == "mov")
+        return "video/quicktime";
     return "";
 }
 

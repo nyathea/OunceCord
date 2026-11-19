@@ -13,6 +13,7 @@ struct Settings {
     bool mouse = true;     // the Joy-Con 2 mouse mode
     bool touch = true;     // the touch screen
     bool qr_login = false; // experimental: log in by scanning a QR code
+    bool videos = false;   // experimental: play videos in chat, send album clips
 
     static const char *themeName(Theme t);  // "Dark", "Light", "AMOLED"
 

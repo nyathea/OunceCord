@@ -4,7 +4,7 @@
 // album service (caps:a, which has ready-made thumbnails) and also scans the
 // album folders directly (system memory and microSD via the image directory
 // file systems, and sdmc:/Nintendo/Album), since the service's listing can
-// leave files out. Duplicates are merged. Videos are left out.
+// leave files out. Duplicates are merged. Video clips are listed too.
 #pragma once
 
 #include <cstdint>
@@ -20,7 +20,8 @@
 class Album {
 public:
     static constexpr size_t kMaxItems = 3000;              // newest first
-    static constexpr uint64_t kMaxFileBytes = 10u << 20;   // Discord's upload limit
+    static constexpr uint64_t kMaxFileBytes = 20u << 20;   // pictures: Discord's upload limit without Nitro
+    static constexpr uint64_t kMaxVideoBytes = 500u << 20; // videos: Nitro's limit
 
     struct Item {
         std::string key;  // image-cache path of the thumbnail ("local:album/...")
@@ -31,14 +32,17 @@ public:
         std::string path;      // otherwise, a file path (sdmc:/..., albumnand:/...)
         bool saved = false;    // from the Saved folder (any picture, named by the user)
         std::string name;      // saved: the file name
+        bool video = false;    // an MP4 clip
 
         std::string label() const { return saved ? name : date.label(); }
-        std::string uploadName() const { return saved ? name : date.fileName(); }
+        std::string uploadName() const { return saved ? name : video ? date.videoFileName() : date.fileName(); }
         std::string contentType() const;
     };
 
-    // Lists the screenshots. False (with error()) when none could be read.
+    // Lists the screenshots (and clips when videos are on). False (with
+    // error()) when none could be read.
     bool refresh();
+    void setVideos(bool on) { m_videos = on; }
     const std::vector<Item> &items() const { return m_items; }
     // Pictures in config::kSavedDir, newest first.
     bool refreshSaved();
@@ -49,8 +53,8 @@ public:
 
     // For the image cache's local loader; thread-safe.
     bool loadThumbnail(const std::string &key, std::string &jpeg);
-    // The whole JPEG, for sending.
-    bool loadFile(const Item &item, std::string &jpeg, std::string &error);
+    // The whole file, for sending; fails above max_bytes (the upload limit).
+    bool loadFile(const Item &item, std::string &data, std::string &error, uint64_t max_bytes);
 
 private:
     std::mutex m_mutex;  // guards m_byKey and caps calls
@@ -60,6 +64,7 @@ private:
     std::map<std::string, Item> m_byKey;
     std::string m_error;
     bool m_capsTried = false, m_capsOk = false;
+    bool m_videos = false;
     bool m_mountTried = false;
     std::vector<std::string> m_mounts;  // mounted image directories ("albumnand:")
 

@@ -3,6 +3,9 @@
 
 #include <cctype>
 
+#include "discord/emoji.h"
+#include "discord/reactions.h"
+
 namespace discord {
 
 static void appendUtf8(std::string &out, uint32_t cp)
@@ -82,6 +85,18 @@ EmoteText extractEmotes(std::string_view content, uint32_t first_cp, uint32_t la
                 continue;
             }
         }
+        // Standard emoji (only non-ASCII bytes and keycaps can start one).
+        unsigned char c = (unsigned char)content[i];
+        if ((c >= 0x80 || c == '#' || c == '*' || (c >= '0' && c <= '9')) && out.emotes.size() < kMaxEmotes) {
+            if (size_t n = emoji::match(content, i)) {
+                Emote e;
+                e.unicode = std::string(content.substr(i, n));
+                appendUtf8(out.text, first_cp + (uint32_t)out.emotes.size());
+                out.emotes.push_back(std::move(e));
+                i += n;
+                continue;
+            }
+        }
         size_t start = i;
         uint32_t cp = nextCp(content, i);
         if (cp >= first_cp && cp <= last_cp) {
@@ -110,6 +125,14 @@ std::string emotesAsText(std::string_view content)
                 continue;
             }
         }
+        const emoji::Entry *entry = nullptr;
+        if ((unsigned char)content[i] >= 0x80) {
+            if (size_t n = emoji::match(content, i, &entry); n && entry && !entry->names.empty()) {
+                out += ":" + entry->names[0] + ":";
+                i += n;
+                continue;
+            }
+        }
         out.push_back(content[i++]);
     }
     return out;
@@ -117,6 +140,10 @@ std::string emotesAsText(std::string_view content)
 
 std::string emotePath(const Emote &e, int size)
 {
+    if (!e.unicode.empty()) {
+        std::string name = twemojiName(e.unicode);
+        return name.empty() ? std::string() : "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/" + name + ".png";
+    }
     return "/emojis/" + std::to_string(e.id) + (e.animated ? ".gif" : ".png") + "?size=" + std::to_string(size) +
            "&quality=lossless";
 }

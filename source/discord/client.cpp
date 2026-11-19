@@ -108,7 +108,115 @@ bool Client::canSend(const Channel &c)
     if (!g)
         return true;
     uint64_t p = g->permissionsIn(c, m_me.id);
-    return (p & perm::ViewChannel) && (p & perm::SendMessages);
+    if (!(p & perm::ViewChannel))
+        return false;
+    if (c.isThread())
+        return (p & perm::SendMessagesInThreads) && (!c.locked || (p & perm::ManageThreads));
+    return p & perm::SendMessages;
+}
+
+void Client::loadForum(Snowflake forum_id)
+{
+    ForumPosts &f = m_forums[forum_id];
+    if (f.loaded || f.loading)
+        return;
+    fetchForumPage(forum_id);
+}
+
+void Client::loadMoreForum(Snowflake forum_id)
+{
+    ForumPosts &f = m_forums[forum_id];
+    if (!f.loaded || f.loading || !f.has_more)
+        return;
+    fetchForumPage(forum_id);
+}
+
+void Client::fetchForumPage(Snowflake forum_id)
+{
+    ForumPosts &f = m_forums[forum_id];
+    Channel *forum = findChannel(forum_id);
+    if (!forum)
+        return;
+    f.loading = true;
+    f.error.clear();
+    Snowflake gid = forum->guild_id;
+    // The search the official client uses for forums: active and archived
+    // posts, newest activity first, with each post's first message.
+    std::string path = "/channels/" + std::to_string(forum_id) +
+                       "/threads/search?archived=true&sort_by=last_message_time&sort_order=desc&limit=25&offset=" +
+                       std::to_string(f.offset);
+    std::weak_ptr<bool> alive = m_alive;
+    m_rest.request("GET", path, "", [this, alive, forum_id, gid](const HttpResponse &res) {
+        if (alive.expired())
+            return;
+        ForumPosts &f = m_forums[forum_id];
+        f.loading = false;
+        json::Value v;
+        if (res.status != 200 || !json::parse(res.body, v) || !v.isObject()) {
+            f.error = res.status == 403 ? "You can't view this channel."
+                      : res.status == 0 ? "Network error: " + res.error
+                                        : "Couldn't load posts (HTTP " + std::to_string(res.status) + ")";
+            logf("client: forum %llu failed (HTTP %d)", (unsigned long long)forum_id, res.status);
+            m_structureVersion++;
+            return;
+        }
+        Guild *g = findGuild(gid);
+        std::set<Snowflake> joined;
+        for (const auto &m : v["members"].items())
+            joined.insert(m["id"].asId());
+        size_t count = 0;
+        for (const auto &t : v["threads"].items()) {
+            count++;
+            if (!g)
+                continue;
+            Snowflake id = t["id"].asId();
+            Channel *c = g->findChannel(id);
+            if (!c) {
+                g->channels.emplace_back();
+                c = &g->channels.back();
+            }
+            c->applyJson(t);
+            c->guild_id = gid;
+            if (joined.count(id))
+                c->joined = true;
+        }
+        for (const auto &m : v["first_messages"].items()) {
+            Message msg = Message::fromJson(m);
+            f.first[msg.channel_id] = std::move(msg);
+        }
+        if (g)
+            g->sortChannels();
+        f.offset += (int)count;
+        f.has_more = v["has_more"].asBool() && count > 0;
+        f.loaded = true;
+        m_structureVersion++;
+    });
+}
+
+void Client::ensureThread(Snowflake thread_id, Snowflake parent_id, Snowflake guild_id, const std::string &name)
+{
+    if (findChannel(thread_id))
+        return;
+    Guild *g = findGuild(guild_id);
+    if (!g)
+        return;
+    Channel c;
+    c.id = thread_id;
+    c.guild_id = guild_id;
+    c.parent_id = parent_id;
+    c.type = ChannelType_PublicThread;
+    c.name = name;
+    g->channels.push_back(std::move(c));
+    g->sortChannels();
+    m_structureVersion++;
+    std::weak_ptr<bool> alive = m_alive;
+    m_rest.request("GET", "/channels/" + std::to_string(thread_id), "", [this, alive](const HttpResponse &res) {
+        if (alive.expired() || res.status != 200)
+            return;
+        json::Value v;
+        if (json::parse(res.body, v))
+            handleChannelUpsert(v);
+    });
 }
 
 void Client::onStatus(GatewayStatus status, const std::string &detail)
@@ -368,6 +476,37 @@ void Client::onDispatch(const std::string &type, const json::Value &d)
     } else if (type == "CHANNEL_CREATE" || type == "CHANNEL_UPDATE" ||
                type == "THREAD_CREATE" || type == "THREAD_UPDATE") {
         handleChannelUpsert(d);
+    } else if (type == "THREAD_LIST_SYNC") {
+        // Active threads of a guild (sent after subscribing to a channel).
+        std::set<Snowflake> joined;
+        for (const auto &m : d["members"].items())
+            joined.insert(m["id"].asId());
+        Snowflake gid = d["guild_id"].asId();
+        for (const auto &t : d["threads"].items()) {
+            json::Value copy = t;
+            copy.set("guild_id", json::Value::string(std::to_string(gid)));
+            handleChannelUpsert(copy);
+            if (joined.count(t["id"].asId()))
+                if (Channel *c = findChannel(t["id"].asId()))
+                    c->joined = true;
+        }
+    } else if (type == "THREAD_MEMBER_UPDATE") {
+        // Ours: we joined this thread.
+        if (Channel *c = findChannel(d["id"].asId()))
+            c->joined = true;
+        m_structureVersion++;
+    } else if (type == "THREAD_MEMBERS_UPDATE") {
+        if (Channel *c = findChannel(d["id"].asId())) {
+            if (d.has("member_count"))
+                c->member_count = (int)d["member_count"].asInt();
+            for (const auto &rid : d["removed_member_ids"].items())
+                if (rid.asId() == m_me.id)
+                    c->joined = false;
+            for (const auto &m : d["added_members"].items())
+                if (m["user_id"].asId() == m_me.id)
+                    c->joined = true;
+            m_structureVersion++;
+        }
     } else if (type == "CHANNEL_DELETE" || type == "THREAD_DELETE") {
         handleChannelDelete(d);
     } else if (type == "GUILD_CREATE") {
@@ -381,6 +520,20 @@ void Client::onDispatch(const std::string &type, const json::Value &d)
                 g->owner_id = props["owner_id"].asId();
             if (props.has("icon"))
                 g->icon = props["icon"].str();
+            if (props.has("premium_tier"))
+                g->premium_tier = (int)props["premium_tier"].asInt();
+            if (d.has("emojis")) {
+                g->emojis.clear();
+                for (const auto &e : d["emojis"].items())
+                    g->emojis.push_back(GuildEmoji::fromJson(e));
+            }
+            m_structureVersion++;
+        }
+    } else if (type == "GUILD_EMOJIS_UPDATE") {
+        if (Guild *g = findGuild(d["guild_id"].asId())) {
+            g->emojis.clear();
+            for (const auto &e : d["emojis"].items())
+                g->emojis.push_back(GuildEmoji::fromJson(e));
             m_structureVersion++;
         }
     } else if (type == "GUILD_DELETE") {
@@ -633,6 +786,57 @@ void Client::toggleReaction(Snowflake channel_id, Snowflake message_id, const Re
                    });
 }
 
+bool Client::canUseEmoji(const Guild &source, const GuildEmoji &e, const Channel *ch)
+{
+    if (!e.available)
+        return false;
+    // Role-locked emotes: one of our roles in its server.
+    if (!e.roles.empty()) {
+        bool ok = false;
+        for (Snowflake r : e.roles)
+            ok |= std::find(source.my_roles.begin(), source.my_roles.end(), r) != source.my_roles.end();
+        if (!ok)
+            return false;
+    }
+    bool here = ch && ch->guild_id == source.id;
+    if (m_me.premium_type == 0)
+        return here && !e.animated;  // no Nitro: this server's still emotes only
+    if (here || !ch || ch->isDm())
+        return true;
+    // Nitro, another server's emote: the channel must allow external emotes.
+    constexpr uint64_t kUseExternalEmojis = 1ull << 18;
+    Guild *g = findGuild(ch->guild_id);
+    return g && (g->permissionsIn(*ch, m_me.id) & kUseExternalEmojis);
+}
+
+const UserProfile *Client::profile(Snowflake user_id, Snowflake guild_id, bool *failed)
+{
+    auto key = std::make_pair(user_id, guild_id);
+    auto it = m_profiles.find(key);
+    if (it != m_profiles.end()) {
+        if (failed)
+            *failed = it->second.failed;
+        return it->second.loaded ? &it->second.profile : nullptr;
+    }
+    m_profiles[key];
+    if (failed)
+        *failed = false;
+    std::weak_ptr<bool> alive = m_alive;
+    m_rest.request("GET", profilePath(user_id, guild_id), "", [this, alive, key](const HttpResponse &res) {
+        if (alive.expired())
+            return;
+        ProfileEntry &e = m_profiles[key];
+        json::Value v;
+        if (res.status == 200 && json::parse(res.body, v) && parseProfile(v, key.first, key.second, e.profile)) {
+            e.loaded = true;
+        } else {
+            logf("client: profile of %llu failed (HTTP %d)", (unsigned long long)key.first, res.status);
+            e.failed = true;
+        }
+    });
+    return nullptr;
+}
+
 void Client::sendMessage(Snowflake channel_id, const std::string &content, const Upload *upload,
                          Snowflake reply_to)
 {
@@ -832,6 +1036,16 @@ void Client::reloadMessages(Snowflake channel_id)
     cm.reload_at = now + 3000;
     cm.loaded = false;
     loadMessages(channel_id);
+}
+
+uint64_t Client::uploadLimit(const Channel &c)
+{
+    int nitro = m_me.premium_type;
+    uint64_t limit = nitro == 2 ? 500ull << 20 : (nitro == 1 || nitro == 3) ? 50ull << 20 : 20ull << 20;
+    if (c.guild_id)
+        if (Guild *g = findGuild(c.guild_id))
+            limit = std::max(limit, g->uploadLimit());
+    return limit;
 }
 
 uint64_t Client::sendCooldownMs(const Channel &c)

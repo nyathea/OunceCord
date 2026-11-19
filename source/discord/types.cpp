@@ -14,6 +14,7 @@ User User::fromJson(const json::Value &v)
     u.avatar = v["avatar"].str();
     u.discriminator = v["discriminator"].str("0");
     u.bot = v["bot"].asBool();
+    u.premium_type = (int)v["premium_type"].asInt();
     return u;
 }
 
@@ -59,6 +60,36 @@ void Channel::applyJson(const json::Value &v, const std::vector<User> *users)
         topic = v["topic"].str();
     if (v.has("icon"))
         icon = v["icon"].str();
+    if (v.has("owner_id"))
+        owner_id = v["owner_id"].asId();
+    if (v.has("message_count"))
+        message_count = (int)v["message_count"].asInt();
+    if (v.has("member_count"))
+        member_count = (int)v["member_count"].asInt();
+    if (v.has("flags"))
+        flags = (int)v["flags"].asInt();
+    if (v.has("thread_metadata")) {
+        archived = v["thread_metadata"]["archived"].asBool();
+        locked = v["thread_metadata"]["locked"].asBool();
+    }
+    if (v.has("member") && v["member"].isObject())
+        joined = true;
+    if (v.has("applied_tags")) {
+        applied_tags.clear();
+        for (const auto &t : v["applied_tags"].items())
+            applied_tags.push_back(t.asId());
+    }
+    if (v.has("available_tags")) {
+        available_tags.clear();
+        for (const auto &t : v["available_tags"].items()) {
+            ForumTag tag;
+            tag.id = t["id"].asId();
+            tag.name = t["name"].str();
+            tag.emoji = t["emoji_name"].str();
+            tag.emoji_id = t["emoji_id"].asId();
+            available_tags.push_back(std::move(tag));
+        }
+    }
     if (v.has("permission_overwrites")) {
         overwrites.clear();
         for (const auto &o : v["permission_overwrites"].items()) {
@@ -92,6 +123,18 @@ void Channel::applyJson(const json::Value &v, const std::vector<User> *users)
     }
 }
 
+GuildEmoji GuildEmoji::fromJson(const json::Value &v)
+{
+    GuildEmoji e;
+    e.id = v["id"].asId();
+    e.name = v["name"].str();
+    e.animated = v["animated"].asBool();
+    e.available = v["available"].asBool(true);
+    for (const auto &r : v["roles"].items())
+        e.roles.push_back(r.asId());
+    return e;
+}
+
 void Guild::applyJson(const json::Value &v)
 {
     // With newer client-state capabilities the guild's own fields are nested
@@ -104,7 +147,15 @@ void Guild::applyJson(const json::Value &v)
         owner_id = props["owner_id"].asId();
     if (props.has("icon"))
         icon = props["icon"].str();
+    if (props.has("premium_tier"))
+        premium_tier = (int)props["premium_tier"].asInt();
     unavailable = v["unavailable"].asBool();
+    if (v.has("emojis")) {
+        emojis.clear();
+        for (const auto &e : v["emojis"].items())
+            if (e["id"].asId())
+                emojis.push_back(GuildEmoji::fromJson(e));
+    }
     if (v.has("roles")) {
         roles.clear();
         for (const auto &r : v["roles"].items())
@@ -186,6 +237,11 @@ uint32_t Guild::colorFor(Snowflake user_id) const
             if (r.id == rid && r.color && (!best || r.position > best->position))
                 best = &r;
     return best ? best->color : 0;
+}
+
+uint64_t Guild::uploadLimit() const
+{
+    return premium_tier >= 3 ? 100ull << 20 : premium_tier == 2 ? 50ull << 20 : 0;
 }
 
 Channel *Guild::findChannel(Snowflake cid)
@@ -340,6 +396,11 @@ Message Message::fromJson(const json::Value &v)
         att.spoiler = att.filename.rfind("SPOILER_", 0) == 0 || (a["flags"].asInt() & 8);
         m.attachments.push_back(att);
     }
+    if (v["thread"].isObject()) {
+        m.thread_id = v["thread"]["id"].asId();
+        m.thread_name = v["thread"]["name"].str();
+        m.thread_count = (int)v["thread"]["message_count"].asInt();
+    }
     m.embed_count = (int)v["embeds"].size();
     for (const auto &e : v["embeds"].items()) {
         const std::string &type = e["type"].asString();
@@ -442,6 +503,21 @@ bool Message::contentIsEmbedLink() const
     return false;
 }
 
+bool Attachment::isVideo() const
+{
+    if (content_type.rfind("video/", 0) == 0)
+        return true;
+    if (!content_type.empty())
+        return false;
+    size_t dot = filename.rfind('.');
+    if (dot == std::string::npos)
+        return false;
+    std::string ext = filename.substr(dot + 1);
+    for (auto &c : ext)
+        c = (char)tolower((unsigned char)c);
+    return ext == "mp4" || ext == "mov" || ext == "m4v" || ext == "webm";
+}
+
 bool Attachment::isImage() const
 {
     if (content_type.rfind("image/", 0) == 0)
@@ -462,6 +538,11 @@ void Message::applyUpdate(const json::Value &v)
 {
     if (v.has("content"))
         content = v["content"].str();
+    if (v["thread"].isObject()) {
+        thread_id = v["thread"]["id"].asId();
+        thread_name = v["thread"]["name"].str();
+        thread_count = (int)v["thread"]["message_count"].asInt();
+    }
     if (v.has("edited_timestamp"))
         edited = !v["edited_timestamp"].isNull();
     if (v.has("mentions") || v.has("mention_roles") || v.has("mention_everyone")) {

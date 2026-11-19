@@ -65,11 +65,14 @@ void Album::listCaps(std::vector<Item> &out)
     if (!m_capsOk)
         return;
     auto add = [&](const CapsAlbumEntry &e) {
+        bool video = e.file_id.content == CapsAlbumFileContents_Movie ||
+                     e.file_id.content == CapsAlbumFileContents_ExtraMovie;
         if (e.file_id.content != CapsAlbumFileContents_ScreenShot &&
-            e.file_id.content != CapsAlbumFileContents_ExtraScreenShot)
+            e.file_id.content != CapsAlbumFileContents_ExtraScreenShot && !video)
             return;
         Item it;
         it.caps = true;
+        it.video = video;
         it.id = e.file_id;
         it.size = e.size;
         const CapsAlbumFileDateTime &dt = e.file_id.datetime;
@@ -92,11 +95,11 @@ void Album::listCaps(std::vector<Item> &out)
                 for (u64 i = 0; i < got && i < count; i++)
                     add(entries[i]);
         }
-        Result rc2 = capsaGetAlbumFileCountEx0(storage, CapsAlbumFileContentsFlag_ScreenShot, &count_ex);
+        const u8 flags = CapsAlbumFileContentsFlag_ScreenShot | CapsAlbumFileContentsFlag_Movie;
+        Result rc2 = capsaGetAlbumFileCountEx0(storage, flags, &count_ex);
         if (R_SUCCEEDED(rc2) && count_ex) {
             std::vector<CapsAlbumEntry> entries(count_ex);
-            rc2 = capsaGetAlbumFileListEx0(storage, CapsAlbumFileContentsFlag_ScreenShot, &got_ex, entries.data(),
-                                           count_ex);
+            rc2 = capsaGetAlbumFileListEx0(storage, flags, &got_ex, entries.data(), count_ex);
             if (R_SUCCEEDED(rc2))
                 for (u64 i = 0; i < got_ex && i < count_ex; i++)
                     add(entries[i]);
@@ -123,14 +126,10 @@ void Album::listDir(const std::string &root, std::vector<Item> &out, int &skippe
                         if (e->d_name[0] == '.')
                             continue;
                         Item it;
-                        if (!album::parseFileName(e->d_name, it.date)) {
-                            std::string n = e->d_name;
-                            bool video = n.size() > 4 && (n.substr(n.size() - 4) == ".mp4" || n.substr(n.size() - 4) == ".MP4");
-                            if (!video) {
-                                skipped++;
-                                if (example.empty())
-                                    example = dp + "/" + n;
-                            }
+                        if (!album::parseFileName(e->d_name, it.date, &it.video)) {
+                            skipped++;
+                            if (example.empty())
+                                example = dp + "/" + e->d_name;
                             continue;
                         }
                         it.path = dp + "/" + e->d_name;
@@ -194,11 +193,14 @@ bool Album::refresh()
 
     // Merge: one entry per screenshot (date plus its id), preferring the
     // album service's, which has a thumbnail API.
-    std::map<uint64_t, Item> merged;
+    // A clip and a screenshot can share a time, so the kind is in the key.
+    std::map<std::pair<uint64_t, bool>, Item> merged;
     for (auto &it : caps)
-        merged.emplace(it.date.sortKey(), std::move(it));
+        if (m_videos || !it.video)
+            merged.emplace(std::make_pair(it.date.sortKey(), it.video), std::move(it));
     for (auto &it : files)
-        merged.emplace(it.date.sortKey(), std::move(it));
+        if (m_videos || !it.video)
+            merged.emplace(std::make_pair(it.date.sortKey(), it.video), std::move(it));
     std::vector<Item> items;
     items.reserve(merged.size());
     for (auto it = merged.rbegin(); it != merged.rend() && items.size() < kMaxItems; ++it)
@@ -206,8 +208,10 @@ bool Album::refresh()
 
     m_error.clear();
     if (items.empty())
-        m_error = "No screenshots found in the album.";
-    logf("album: %zu screenshots in all (%zu from the album service)", items.size(), caps.size());
+        m_error = m_videos ? "No screenshots or videos found in the album." : "No screenshots found in the album.";
+    size_t videos = std::count_if(items.begin(), items.end(), [](const Item &i) { return i.video; });
+    logf("album: %zu items in all, %zu of them videos (%zu from the album service)", items.size(), videos,
+         caps.size());
     std::lock_guard<std::mutex> lock(m_mutex);
     m_items = std::move(items);
     index();
@@ -226,7 +230,7 @@ void Album::index()
 std::string Album::Item::contentType() const
 {
     std::string t = imageutil::contentTypeForName(saved ? name : path);
-    return t.empty() ? "image/jpeg" : t;
+    return t.empty() ? (video ? "video/mp4" : "image/jpeg") : t;
 }
 
 bool Album::refreshSaved()
@@ -240,6 +244,9 @@ bool Album::refreshSaved()
             Item it;
             it.saved = true;
             it.name = n;
+            it.video = imageutil::contentTypeForName(n).rfind("video/", 0) == 0;
+            if (it.video && !m_videos)
+                continue;
             it.path = std::string(config::kSavedDir) + "/" + n;
             struct stat st{};
             time_t mtime = 0;
@@ -283,6 +290,8 @@ bool Album::loadThumbnail(const std::string &key, std::string &jpeg)
         jpeg.resize(size);
         return true;
     }
+    if (it.video)
+        return false;  // only the album service has previews of clips
     std::string file;
     if (!readWhole(it.path, file, it.saved ? (64u << 20) : kMaxFileBytes))
         return false;
@@ -294,19 +303,65 @@ bool Album::loadThumbnail(const std::string &key, std::string &jpeg)
     return true;
 }
 
-bool Album::loadFile(const Item &item, std::string &jpeg, std::string &error)
+static std::string megabytes(uint64_t bytes)
 {
-    if (item.size > kMaxFileBytes) {
-        error = "That picture is over Discord's 10 MB limit.";
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.1f MB", bytes / 1048576.0);
+    return buf;
+}
+
+bool Album::loadFile(const Item &item, std::string &jpeg, std::string &error, uint64_t max_bytes)
+{
+    const char *what = item.video ? "video" : "picture";
+    auto tooBig = [&](uint64_t size) {
+        error = "That " + std::string(what) + " is " + megabytes(size) + ", over your " + megabytes(max_bytes) +
+                " upload limit here.";
         return false;
+    };
+    if (item.size > max_bytes)
+        return tooBig(item.size);
+    if (item.caps && item.video) {
+        // Clips are read through a movie stream, in its block size.
+        std::lock_guard<std::mutex> lock(m_mutex);
+        u64 stream = 0, size = 0;
+        Result rc = capsaOpenAlbumMovieStream(&stream, &item.id);
+        if (R_SUCCEEDED(rc))
+            rc = capsaGetAlbumMovieStreamSize(stream, &size);
+        if (R_FAILED(rc) || !size) {
+            if (stream)
+                capsaCloseAlbumMovieStream(stream);
+            logf("album: movie stream failed: 0x%x", rc);
+            error = "Couldn't read that video.";
+            return false;
+        }
+        if (size > max_bytes || size > kMaxVideoBytes) {
+            capsaCloseAlbumMovieStream(stream);
+            return tooBig(size);
+        }
+        constexpr size_t kBlock = 0x40000;
+        jpeg.resize((size_t)((size + kBlock - 1) / kBlock * kBlock));
+        for (u64 off = 0; off < size && R_SUCCEEDED(rc); off += kBlock) {
+            u64 got = 0;
+            rc = capsaReadMovieDataFromAlbumMovieReadStream(stream, (s64)off, jpeg.data() + off, kBlock, &got);
+        }
+        capsaCloseAlbumMovieStream(stream);
+        if (R_FAILED(rc)) {
+            logf("album: movie read failed: 0x%x", rc);
+            error = "Couldn't read that video.";
+            return false;
+        }
+        jpeg.resize((size_t)size);
+        return true;
     }
     if (item.caps) {
         std::lock_guard<std::mutex> lock(m_mutex);
         u64 size = item.size;
         if (!size && R_FAILED(capsaGetAlbumFileSize(&item.id, &size)))
             size = 0;
+        if (size > max_bytes)
+            return tooBig(size);
         if (!size || size > kMaxFileBytes) {
-            error = size ? "That picture is over Discord's 10 MB limit." : "Couldn't read that picture.";
+            error = "Couldn't read that picture.";
             return false;
         }
         jpeg.resize(size);
@@ -320,8 +375,12 @@ bool Album::loadFile(const Item &item, std::string &jpeg, std::string &error)
         jpeg.resize(std::min<u64>(got, size));
         return true;
     }
-    if (!readWhole(item.path, jpeg, kMaxFileBytes)) {
-        error = "Couldn't read that picture.";
+    uint64_t limit = std::min<uint64_t>(max_bytes, item.video ? kMaxVideoBytes : (64u << 20));
+    if (!readWhole(item.path, jpeg, limit)) {
+        struct stat st{};
+        if (stat(item.path.c_str(), &st) == 0 && (uint64_t)st.st_size > limit)
+            return tooBig((uint64_t)st.st_size);
+        error = "Couldn't read that " + std::string(what) + ".";
         return false;
     }
     return true;

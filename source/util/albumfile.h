@@ -16,11 +16,13 @@ struct Date {
     uint64_t sortKey() const;
     std::string label() const;     // "2026-11-18 14:03"
     std::string fileName() const;  // "screenshot-2026-11-18-140322.jpg"
+    std::string videoFileName() const;  // "clip-2026-11-18-140322.mp4"
 };
 
 // "2026111814032200-0123456789ABCDEF0123456789ABCDEF.jpg" (the date part
-// is YYYYMMDDHHMMSS plus a two-digit id). False for other names.
-bool parseFileName(std::string_view name, Date &out);
+// is YYYYMMDDHHMMSS plus a two-digit id), or the same with .mp4 for a video
+// (video is set then). False for other names.
+bool parseFileName(std::string_view name, Date &out, bool *video = nullptr);
 
 // The EXIF thumbnail embedded in a JPEG, as a view into it. False when the
 // file has none.

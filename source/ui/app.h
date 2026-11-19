@@ -15,12 +15,15 @@
 #include "discord/client.h"
 #include "discord/mentions.h"
 #include "discord/remoteauth.h"
+#include "media/fetch.h"
+#include "media/player.h"
 #include "settings.h"
 #include "ui/album.h"
 #include "ui/images.h"
 #include "ui/saver.h"
 #include "ui/render.h"
 #include "util/qr.h"
+#include "util/scroller.h"
 
 class App {
 public:
@@ -52,6 +55,8 @@ private:
         bool header = false;  // category title, not selectable
         bool voice = false;   // shown, but cannot be opened
         std::string icon;     // CDN path for DMs
+        const char *kind = nullptr;  // built-in icon before the name ("hash", "voice"...)
+        int indent = 0;              // threads sit under their channel
     };
 
     // A picture in a message (attachment or embed image).
@@ -60,6 +65,8 @@ private:
         std::string url;     // sized for the message list
         std::string name;    // file name, if any
         std::string animated;  // Tenor/Giphy GIF to play instead of the still
+        std::string video;     // a video attachment's URL: the picture is its poster
+        uint64_t video_size = 0;
         float w = 0, h = 0;  // display size in the list
         int src_w = 0, src_h = 0;  // original size (0 if unknown)
         bool spoiler = false;
@@ -74,33 +81,45 @@ private:
         Snowflake id = 0;
         Snowflake author_id = 0;
         std::string avatar;  // CDN path
+        std::string username;  // account name, for the profile card
+        bool bot = false, webhook = false;
         bool show_header = false;
         float height = 0;
         float top = 0;  // from the top of the whole layout
         std::string author, time;
         Color author_color;  // highest coloured role, else the normal name colour
-        std::vector<std::string> lines;
         std::vector<std::pair<std::string, Color>> extras;  // reply/attachments/embeds
         std::string reply;
         Color text_color;
         std::vector<ImageBlock> images;
-        // Custom emotes: the text has a placeholder for each (see
-        // discord/emotes.h); line_emotes gives where they sit on each line.
+        // The text (markdown laid out): styled runs at positions relative to
+        // the text's top left, plus code block boxes and quote bars.
         float text_size = 17;  // larger for emote-only ("jumbo") messages
         std::vector<std::string> emotes;  // CDN paths
-        std::vector<std::vector<std::pair<float, uint32_t>>> line_emotes;  // x, emote index
-        // Each line split into runs of plain text and mentions (span >= 0
-        // indexes span_styles); a mention can continue onto the next line.
         struct Run {
-            float x = 0, w = 0;
+            float x = 0, y = 0, w = 0, h = 0;  // h: the line's height
+            float size = 17;
             std::string text;
-            int span = -1;
+            uint16_t style = 0;  // discord::md::Style, plus kCodeBlockRun
+            int span = -1;       // mention: index into span_styles
+            int spoiler = -1;
+            bool bold = false;   // headings
+            Color fg;
+        };
+        struct EmoteAt {
+            float x = 0, y = 0, size = 0;
+            uint32_t index = 0;
+            int spoiler = -1;
         };
         struct SpanStyle {
             Color fg, bg;
         };
-        std::vector<std::vector<Run>> line_runs;
+        std::vector<Run> runs;
+        std::vector<EmoteAt> emote_at;
+        std::vector<Rect> code_boxes, quote_bars;
         std::vector<SpanStyle> span_styles;
+        float text_h = 0;
+        int spoilers = 0;
         bool mentions_me = false;  // drawn with a highlighted background
         bool can_reply = false;    // a sent, ordinary message
         // Reactions, as chips under the message (rows wrap at the text width).
@@ -112,11 +131,32 @@ private:
             int row = 0;
         };
         std::vector<Chip> chips;
+        // A thread started from this message, shown as a box under it.
+        Snowflake thread_id = 0;
+        std::string thread_name, thread_info;
     };
     struct ReactionHit {
         Rect rect;
         size_t layout = 0, chip = 0;
     };
+    struct SpoilerHit {
+        Rect rect;
+        size_t layout = 0;
+        int spoiler = 0;
+    };
+    // Lays out a message's text (markdown) into L.runs etc.
+    void layoutText(MessageLayout &L, const Message &m, const std::string &content, bool system, float width);
+    std::string spoilerKey(const MessageLayout &L, int spoiler) const;
+    bool revealSpoilers(size_t layout);  // false if none were hidden
+    // A focusable part of the highlighted message, picked with left/right.
+    enum class PartKind { None, Avatar, Reply, Image, Thread, Reaction };
+    struct Part {
+        PartKind kind = PartKind::None;
+        size_t index = 0;  // image or chip
+        bool operator==(const Part &o) const { return kind == o.kind && index == o.index; }
+    };
+    // Focusable things in the bar under the messages, picked with left/right.
+    enum class ComposeItem { Attach, RemoveImage, Text, Emoji, Send, CancelReply };
     // Resolves names for mentions in a message (null: no message context).
     discord::MentionLookup mentionLookup(const Message *m);
 
@@ -145,10 +185,27 @@ private:
 
     // Selection. Guild index 0 is the direct messages list.
     int m_guildIndex = 0;
-    int m_guildScroll = 0;
+    float m_guildScroll = 0;
     int m_channelIndex = 0;
     float m_channelScroll = 0;
     Snowflake m_openChannel = 0;
+    // A forum/media channel shows its posts while no post is open; a post
+    // (a thread) opens as a chat, and B goes back to the posts.
+    Snowflake m_openForum = 0;
+    // A thread opened from a message: B goes back to that channel.
+    Snowflake m_threadReturn = 0;
+    int m_forumIndex = 0;
+    float m_forumScroll = 0, m_forumContentH = 0;
+    bool m_forumScrollPending = false;
+    Scroller m_forumScroller;
+    std::vector<Snowflake> m_forumPosts;                 // in display order
+    std::vector<std::pair<Rect, size_t>> m_forumHits;   // cards drawn this frame
+    std::vector<std::pair<Rect, size_t>> m_threadHits;  // thread boxes drawn this frame (layout index)
+    bool inForum() const { return m_openForum && !m_openChannel; }
+    void openForum(Snowflake id);
+    void openThread(Snowflake thread_id, Snowflake parent_id, const std::string &name);
+    void buildForumPosts();
+    void drawForum(Rect area);
     std::vector<ChannelRow> m_rows;
     uint32_t m_rowsVersion = ~0u;
     int m_rowsGuild = -1;
@@ -162,9 +219,37 @@ private:
     std::vector<ImageHit> m_imageHits;    // images drawn this frame
     std::set<std::string> m_revealed;     // spoilers the user opened
     std::vector<ReactionHit> m_reactionHits;              // chips drawn this frame
+    std::vector<SpoilerHit> m_spoilerHits;                // hidden spoilers drawn this frame
     std::vector<std::pair<Rect, size_t>> m_messageHits;  // visible messages, for taps
+    std::vector<std::pair<Rect, size_t>> m_avatarHits;   // avatars drawn this frame
     Rect m_replyButton{};                                 // on the highlighted/hovered message
     int m_replyButtonLayout = -1;                         // -1: not shown
+    Part m_selPart;                       // part of the highlighted message with focus
+    bool m_composeFocus = false;          // focus is in the text box row
+    ComposeItem m_composeSel = ComposeItem::Text;
+    bool m_gearFocus = false;             // the settings gear, below the channel list
+    std::vector<Part> messageParts(size_t layout) const;
+    bool partFocused(size_t layout, PartKind kind, size_t index = 0) const;
+    bool stepPart(int dir);     // false at either end
+    void activatePart();
+    std::vector<ComposeItem> composeItems();
+    bool composeFocused(ComposeItem item) const;
+    bool stepCompose(int dir);  // false at either end
+    void composeActivate(ComposeItem item);
+    void drawFocusRing(Rect r);
+    // Profile card for a message's author.
+    struct Profile {
+        Snowflake id = 0, guild = 0;
+        std::string name, username, avatar;
+        Color color;
+        bool bot = false, webhook = false;
+    };
+    bool m_profileOpen = false;
+    Profile m_profile;
+    float m_profileScroll = 0, m_profileContentH = 0;
+    void openProfile(size_t layout);
+    Rect profileCardRect() const;
+    void drawProfile();
     // Unsent text (and screenshot) per channel: the keyboard and the picker
     // fill it, (Y) or the send button sends it.
     struct Draft {
@@ -179,10 +264,46 @@ private:
     uint64_t m_composeErrorUntil = 0;
 
     // The (X) menu: write a message, attach or remove a screenshot.
-    enum class ComposeAction { Reply, Reactions, Write, Attach, Remove, CancelReply };
+    enum class ComposeAction { Write, Emoji, Attach, Remove, CancelReply };
     bool m_composeMenuOpen = false;
     int m_composeMenuIndex = 0;
-    int m_composeReactIndex = 0;  // chip picked in the Reactions row
+
+    // Emote picker: the emotes we may send here, by server and category.
+    struct EmojiItem {
+        std::string insert;  // added to the draft: ":name:" for custom emotes, the emoji itself
+        std::string image;   // CDN path or Twemoji URL
+        std::string name;    // shown under the grid
+    };
+    struct EmojiSection {
+        std::string title;
+        std::vector<EmojiItem> items;
+    };
+    struct EmojiCell {
+        Rect rect;  // in content space (before scrolling)
+        size_t section = 0, item = 0;
+    };
+    bool m_emojiOpen = false;
+    std::vector<EmojiSection> m_emojiSections;
+    std::vector<EmojiCell> m_emojiCells;  // flat, in order
+    std::vector<std::pair<float, std::string>> m_emojiHeaders;  // y, title
+    float m_emojiContentH = 0;
+    int m_emojiIndex = 0;  // into m_emojiCells
+    float m_emojiScroll = 0;
+    bool m_emojiScrollPending = false;
+    Scroller m_emojiScroller;
+    std::string m_emojiQuery;
+    void openEmojiPicker();
+    void buildEmojiSections();  // for the open channel and m_emojiQuery
+    void layoutEmojiGrid();
+    Rect emojiCardRect() const;
+    Rect emojiGridRect() const;
+    void emojiInsert(int index);
+    void emojiMove(int dx, int dy);
+    void handleEmojiInput(u64 down);
+    void drawEmojiPicker();
+    Rect emojiButtonRect() const;  // in the message bar
+    // Turns :shortcodes: into emotes and emoji for sending in channel ch.
+    std::string convertShortcodes(const std::string &text, const Channel &ch);
 
     // Screenshot picker.
     Album m_album;
@@ -214,6 +335,21 @@ private:
     bool m_selScrollPending = false;  // scroll it into view on the next draw
     uint64_t m_stickRepeatAt = 0;
 
+    // Full-screen video player: downloads the video, then plays it.
+    bool m_videoOpen = false;
+    ImageBlock m_videoBlock;
+    VideoFetch m_videoFetch;
+    VideoPlayer m_player;
+    std::string m_videoError;
+    void openVideo(const ImageBlock &block);
+    void closeVideo();
+    void updateVideo();  // per frame: takes the download, advances the player
+    void handleVideoInput(u64 down);
+    void videoTap(float x, float y);
+    Rect videoBarRect() const;   // the seek bar
+    Rect videoCloseRect() const;
+    void drawVideo();
+
     // Full-screen image viewer.
     bool m_viewerOpen = false;
     std::vector<ImageBlock> m_viewerImages;  // the channel's images, oldest first
@@ -225,6 +361,21 @@ private:
     bool m_touching = false;
     float m_touchStartX = 0, m_touchStartY = 0, m_touchLastY = 0;
     bool m_touchDragged = false;
+    // Scrolling physics (momentum and rubber banding) for touch and mouse drags.
+    Scroller m_msgScroller, m_channelScroller, m_guildScroller, m_pickerScroller, m_profileScroller;
+    struct ScrollTarget {
+        Scroller *scroller;
+        float *pos;
+        float sign;  // offset change per pixel the pointer moves down
+    };
+    ScrollTarget scrollTarget(float start_x);
+    VelocityTracker m_dragVelocity;
+    ScrollTarget m_dragTarget{nullptr, nullptr, 1};  // grabbed on press, released on lift
+    bool m_dragStoppedGlide = false;  // the press stopped a glide: not a tap
+    float m_frameDt = 1 / 60.0f;      // seconds since the last frame
+    int m_guildShown = -1, m_channelShown = -1;  // selection last scrolled into view
+    void pointerDown(float x, float y);
+    void pointerUp(float y, bool dragged);
 
     // Mouse mode (Switch 2 Joy-Con optical pointer).
 #if defined(__SWITCH2__)
@@ -245,7 +396,7 @@ private:
     Settings m_settings;
     bool m_settingsOpen = false;
     int m_settingsIndex = 0;
-    enum class SettingRow { Theme, Mouse, Touch, QrLogin, LogOut };
+    enum class SettingRow { Theme, Mouse, Touch, QrLogin, Videos, LogOut };
     struct SettingItem {
         SettingRow row;
         Rect rect;
@@ -282,8 +433,6 @@ private:
     void composeMenuChoose(ComposeAction a);
     void handleComposeMenuInput(u64 down);
     void drawComposeMenu();
-    // Chip rects in the menu's Reactions row (scrolled to show the picked one).
-    std::vector<Rect> composeChipRects(Rect item, const std::vector<MessageLayout::Chip> &chips) const;
     void drawChip(Rect r, const MessageLayout::Chip &c, bool focus);
     void startReply(size_t layout);  // shows the "Replying to" bar
     void toggleReaction(size_t layout, size_t chip);
@@ -313,7 +462,7 @@ private:
     u64 handlePointer();
     // Shared by touch and mouse.
     void tapAt(float x, float y);
-    void dragScroll(float start_x, float dy);
+    void dragScroll(float start_x, float dy, bool rubber = true);
     void wheelScroll(float x, float y, float amount);
     int hitGuild(float x, float y) const;       // guild bar index, or -1
     int hitChannelRow(float x, float y) const;  // row index, or -1
@@ -346,6 +495,9 @@ private:
     static void fitImage(int src_w, int src_h, float max_w, float max_h, bool allow_up, float &w, float &h);
     // Draws the image at icon (a CDN path) as a circle, or a coloured circle
     // with the name's first letter while it loads or when there is none.
+    // Draws a built-in icon (tools/pack_assets.py) into r, tinted (masks are
+    // white, so the tint is their colour). Nothing while it loads.
+    void drawIcon(const char *name, Rect r, Color tint = Color(255, 255, 255));
     void drawAvatar(float cx, float cy, float radius, const std::string &name, Snowflake id,
                     const std::string &icon = {});
 };

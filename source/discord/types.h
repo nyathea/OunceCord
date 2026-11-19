@@ -18,6 +18,8 @@ constexpr uint64_t ManageMessages = 1ULL << 13;
 constexpr uint64_t ViewChannel = 1ULL << 10;
 constexpr uint64_t SendMessages = 1ULL << 11;
 constexpr uint64_t ReadMessageHistory = 1ULL << 16;
+constexpr uint64_t ManageThreads = 1ULL << 34;
+constexpr uint64_t SendMessagesInThreads = 1ULL << 38;
 constexpr uint64_t All = ~0ULL;
 }  // namespace perm
 
@@ -43,6 +45,7 @@ struct User {
     std::string avatar;         // CDN hash, empty for the default avatar
     std::string discriminator;  // "0" for users on the new username system
     bool bot = false;
+    int premium_type = 0;  // Nitro: 0 none, 1 Classic, 2 Nitro, 3 Basic (only for ourselves)
 
     const std::string &displayName() const { return global_name.empty() ? username : global_name; }
     static User fromJson(const json::Value &v);
@@ -58,6 +61,17 @@ struct Role {
     static Role fromJson(const json::Value &v);
 };
 
+// A server's custom emote.
+struct GuildEmoji {
+    Snowflake id = 0;
+    std::string name;
+    bool animated = false;
+    bool available = true;          // false when the server lost the boost it needs
+    std::vector<Snowflake> roles;   // only these roles may use it (empty: everyone)
+
+    static GuildEmoji fromJson(const json::Value &v);
+};
+
 // A user's membership of one server: their server nickname and roles.
 struct Member {
     std::string nick;
@@ -69,6 +83,14 @@ struct Overwrite {
     int type = 0;  // 0 role, 1 member
     uint64_t allow = 0;
     uint64_t deny = 0;
+};
+
+// A forum or media channel's post tag.
+struct ForumTag {
+    Snowflake id = 0;
+    std::string name;
+    std::string emoji;       // a standard emoji, or empty
+    Snowflake emoji_id = 0;  // a custom emote, or 0
 };
 
 struct Channel {
@@ -84,6 +106,25 @@ struct Channel {
     std::string icon;  // group DM icon hash
     std::vector<Overwrite> overwrites;
     std::vector<User> recipients;  // DMs
+    // Threads (and forum posts).
+    Snowflake owner_id = 0;
+    int message_count = 0;
+    int member_count = 0;
+    int flags = 0;  // 2: pinned post
+    bool archived = false;
+    bool locked = false;
+    bool joined = false;  // we are a member of this thread
+    std::vector<Snowflake> applied_tags;
+    // Forum and media channels: the tags posts can have.
+    std::vector<ForumTag> available_tags;
+
+    bool isThread() const
+    {
+        return type == ChannelType_PublicThread || type == ChannelType_PrivateThread ||
+               type == ChannelType_AnnouncementThread;
+    }
+    bool isForum() const { return type == ChannelType_GuildForum || type == ChannelType_GuildMedia; }
+    bool pinned() const { return flags & 2; }
 
     bool isText() const
     {
@@ -105,9 +146,11 @@ struct Guild {
     Snowflake owner_id = 0;
     std::string name;
     std::string icon;  // CDN hash
+    int premium_tier = 0;  // server boost level, 0-3
     std::vector<Role> roles;
     std::vector<Channel> channels;  // sorted for display by sortChannels
     std::vector<Snowflake> my_roles;
+    std::vector<GuildEmoji> emojis;
     // Members we have seen (message authors, member chunks...), by user id.
     std::map<Snowflake, Member> members;
     bool unavailable = false;
@@ -128,6 +171,8 @@ struct Guild {
     std::string nameFor(const User &u) const;
     // The colour of the user's highest coloured role, or 0.
     uint32_t colorFor(Snowflake user_id) const;
+    // Largest upload the boost level allows here (0 when it adds nothing).
+    uint64_t uploadLimit() const;
 };
 
 struct Attachment {
@@ -141,6 +186,8 @@ struct Attachment {
 
     // Shown inline as a picture (not a video or other file).
     bool isImage() const;
+    // A video (shown as its poster with a play button).
+    bool isVideo() const;
 };
 
 // A picture from an embed (a link preview, or a posted image/GIF link).
@@ -200,6 +247,10 @@ struct Message {
     std::vector<Snowflake> mention_roles;
     bool mention_everyone = false;
     std::vector<Reaction> reactions;
+    // A thread started from this message.
+    Snowflake thread_id = 0;
+    std::string thread_name;
+    int thread_count = 0;  // messages in it
     const std::string *mentionName(Snowflake id) const;
     // Local bookkeeping for messages we sent and are waiting on.
     std::string nonce;

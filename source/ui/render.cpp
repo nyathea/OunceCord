@@ -8,6 +8,7 @@
 
 #include <switch.h>
 
+#include "util/assets.h"
 #include "util/util.h"
 
 static const char *const kVertexSource =
@@ -78,6 +79,29 @@ static const char *const kImageFragmentSource =
     "    }\n"
     "    vec4 c = texture(u_image, v_uv) * v_color;\n"
     "    o_color = vec4(c.rgb, c.a * mask);\n"
+    "}\n";
+
+// Video frames: NV12 (a luma texture and an interleaved chroma texture) to
+// RGB, limited range, BT.709 or BT.601.
+static const char *const kNv12FragmentSource =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_uv;\n"
+    "in vec4 v_color;\n"
+    "uniform sampler2D u_y;\n"
+    "uniform sampler2D u_uv;\n"
+    "uniform int u_bt709;\n"
+    "uniform vec2 u_screen;\n"
+    "out vec4 o_color;\n"
+    "void main() {\n"
+    "    float y = (texture(u_y, v_uv).r - 16.0 / 255.0) * (255.0 / 219.0);\n"
+    "    vec2 c = (texture(u_uv, v_uv).rg - 128.0 / 255.0) * (255.0 / 224.0);\n"
+    "    vec3 rgb;\n"
+    "    if (u_bt709 == 1)\n"
+    "        rgb = vec3(y + 1.5748 * c.y, y - 0.1873 * c.x - 0.4681 * c.y, y + 1.8556 * c.x);\n"
+    "    else\n"
+    "        rgb = vec3(y + 1.402 * c.y, y - 0.3441 * c.x - 0.7141 * c.y, y + 1.772 * c.x);\n"
+    "    o_color = vec4(clamp(rgb, 0.0, 1.0), v_color.a);\n"
     "}\n";
 
 static GLuint linkProgram(const char *name, GLuint vs, GLuint fs)
@@ -163,6 +187,15 @@ bool Renderer::init()
     m_uImgShape = glGetUniformLocation(m_imageProgram, "u_shape");
     m_uImgRadius = glGetUniformLocation(m_imageProgram, "u_radius");
 
+    vs = compileShader(GL_VERTEX_SHADER, kVertexSource);
+    fs = compileShader(GL_FRAGMENT_SHADER, kNv12FragmentSource);
+    m_nv12Program = linkProgram("nv12", vs, fs);
+    m_uNvScreen = glGetUniformLocation(m_nv12Program, "u_screen");
+    m_uNvBt709 = glGetUniformLocation(m_nv12Program, "u_bt709");
+    glUseProgram(m_nv12Program);
+    glUniform1i(glGetUniformLocation(m_nv12Program, "u_y"), 0);
+    glUniform1i(glGetUniformLocation(m_nv12Program, "u_uv"), 1);
+
     // 1x1 white texture, for filling shapes with the image program.
     const uint8_t white[4] = {255, 255, 255, 255};
     glGenTextures(1, &m_whiteTex);
@@ -231,6 +264,21 @@ bool Renderer::initFonts()
         fclose(f);
     }
 
+    // The built-in gg sans next (when there's no user font, also its
+    // semibold for names and headings), then the system fonts for the
+    // characters it lacks (CJK, symbols, emoji).
+    std::string_view normal = assets::get("font/normal");
+    bool user_font = !m_faces.empty();
+    FT_Face face;
+    if (!normal.empty() && loadMemoryFace(normal.data(), normal.size(), face))
+        m_faces.push_back(face);
+    const char *styled[4] = {nullptr, "font/semibold", "font/italic", "font/semibold-italic"};
+    for (int k = 1; k < 4 && !user_font; k++) {
+        std::string_view data = assets::get(styled[k]);
+        if (!data.empty() && loadMemoryFace(data.data(), data.size(), face))
+            m_styleFaces[k] = face;
+    }
+
     if (R_SUCCEEDED(plInitialize(PlServiceType_User))) {
         const PlSharedFontType order[] = {
             PlSharedFontType_Standard, PlSharedFontType_NintendoExt,
@@ -241,7 +289,6 @@ bool Renderer::initFonts()
             PlFontData font;
             if (R_FAILED(plGetSharedFontByType(&font, type)))
                 continue;
-            FT_Face face;
             if (FT_New_Memory_Face(m_ft, (const FT_Byte *)font.address, font.size, 0, &face) == 0)
                 m_faces.push_back(face);
         }
@@ -256,11 +303,21 @@ bool Renderer::initFonts()
     return true;
 }
 
+bool Renderer::loadMemoryFace(const void *data, size_t size, FT_Face &face)
+{
+    return FT_New_Memory_Face(m_ft, (const FT_Byte *)data, (FT_Long)size, 0, &face) == 0;
+}
+
 void Renderer::exit()
 {
     for (FT_Face f : m_faces)
         FT_Done_Face(f);
     m_faces.clear();
+    for (FT_Face &f : m_styleFaces) {
+        if (f)
+            FT_Done_Face(f);
+        f = nullptr;
+    }
     if (m_ft)
         FT_Done_FreeType(m_ft);
     m_ft = nullptr;
@@ -299,7 +356,8 @@ void Renderer::resetAtlas()
 
 const Renderer::Glyph *Renderer::glyph(uint32_t cp, int px)
 {
-    uint64_t key = ((uint64_t)px << 32) | cp;
+    FT_Face styled = m_styleFaces[m_style];
+    uint64_t key = ((uint64_t)(styled ? m_style : 0) << 61) | ((uint64_t)px << 32) | cp;
     auto it = m_glyphs.find(key);
     if (it != m_glyphs.end())
         return &it->second;
@@ -314,7 +372,11 @@ const Renderer::Glyph *Renderer::glyph(uint32_t cp, int px)
 
     FT_Face face = nullptr;
     FT_UInt index = 0;
+    if (styled && (index = FT_Get_Char_Index(styled, cp)))
+        face = styled;
     for (FT_Face f : m_faces) {
+        if (face)
+            break;
         index = FT_Get_Char_Index(f, cp);
         if (index) {
             face = f;
@@ -435,7 +497,8 @@ void Renderer::fillTriangle(float x0, float y0, float x1, float y1, float x2, fl
 void Renderer::fillCircle(float cx, float cy, float radius, Color c)
 {
     float s = m_scale;
-    const int segments = 24;
+    // Enough segments that the edge doesn't look faceted at this size.
+    const int segments = std::clamp((int)(radius * s * 1.6f), 24, 128);
     for (int i = 0; i < segments; i++) {
         float a0 = (float)i / segments * 6.2831853f;
         float a1 = (float)(i + 1) / segments * 6.2831853f;
@@ -611,6 +674,27 @@ void Renderer::drawImage(GLuint tex, Rect r, Shape shape, Color tint)
     glUniform1f(m_uImgRadius, shape == Shape::Rect ? 0.0f : 6.0f * s);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
+    glBindVertexArray(m_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+    glBufferData(GL_ARRAY_BUFFER, m_verts.size() * sizeof(Vertex), m_verts.data(), GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)m_verts.size());
+    m_verts.clear();
+}
+
+void Renderer::drawNv12(GLuint y_tex, GLuint uv_tex, Rect r, bool bt709)
+{
+    if (!y_tex || !uv_tex)
+        return;
+    flush();
+    float s = m_scale;
+    pushQuad(r.x * s, r.y * s, (r.x + r.w) * s, (r.y + r.h) * s, 0, 0, 1, 1, Color(255, 255, 255));
+    glUseProgram(m_nv12Program);
+    glUniform2f(m_uNvScreen, (float)m_surfaceW, (float)m_surfaceH);
+    glUniform1i(m_uNvBt709, bt709 ? 1 : 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, uv_tex);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, y_tex);
     glBindVertexArray(m_vao);
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
     glBufferData(GL_ARRAY_BUFFER, m_verts.size() * sizeof(Vertex), m_verts.data(), GL_STREAM_DRAW);
