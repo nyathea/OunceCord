@@ -78,6 +78,7 @@ private:
         float height = 0;
         float top = 0;  // from the top of the whole layout
         std::string author, time;
+        Color author_color;  // highest coloured role, else the normal name colour
         std::vector<std::string> lines;
         std::vector<std::pair<std::string, Color>> extras;  // reply/attachments/embeds
         std::string reply;
@@ -101,6 +102,20 @@ private:
         std::vector<std::vector<Run>> line_runs;
         std::vector<SpanStyle> span_styles;
         bool mentions_me = false;  // drawn with a highlighted background
+        bool can_reply = false;    // a sent, ordinary message
+        // Reactions, as chips under the message (rows wrap at the text width).
+        struct Chip {
+            Reaction reaction;
+            std::string image;  // CDN path or Twemoji URL, empty if none
+            std::string count;
+            float x = 0, w = 0;
+            int row = 0;
+        };
+        std::vector<Chip> chips;
+    };
+    struct ReactionHit {
+        Rect rect;
+        size_t layout = 0, chip = 0;
     };
     // Resolves names for mentions in a message (null: no message context).
     discord::MentionLookup mentionLookup(const Message *m);
@@ -146,21 +161,28 @@ private:
     Snowflake m_layoutChannel = 0;
     std::vector<ImageHit> m_imageHits;    // images drawn this frame
     std::set<std::string> m_revealed;     // spoilers the user opened
+    std::vector<ReactionHit> m_reactionHits;              // chips drawn this frame
+    std::vector<std::pair<Rect, size_t>> m_messageHits;  // visible messages, for taps
+    Rect m_replyButton{};                                 // on the highlighted/hovered message
+    int m_replyButtonLayout = -1;                         // -1: not shown
     // Unsent text (and screenshot) per channel: the keyboard and the picker
     // fill it, (Y) or the send button sends it.
     struct Draft {
         std::string text;
         bool has_image = false;
         Album::Item image;
+        Snowflake reply_to = 0;  // message being replied to
+        std::string reply_name;
     };
     std::map<Snowflake, Draft> m_drafts;
     std::string m_composeError;  // shown under the text box for a while
     uint64_t m_composeErrorUntil = 0;
 
     // The (X) menu: write a message, attach or remove a screenshot.
-    enum class ComposeAction { Write, Attach, Remove };
+    enum class ComposeAction { Reply, Reactions, Write, Attach, Remove, CancelReply };
     bool m_composeMenuOpen = false;
     int m_composeMenuIndex = 0;
+    int m_composeReactIndex = 0;  // chip picked in the Reactions row
 
     // Screenshot picker.
     Album m_album;
@@ -260,6 +282,14 @@ private:
     void composeMenuChoose(ComposeAction a);
     void handleComposeMenuInput(u64 down);
     void drawComposeMenu();
+    // Chip rects in the menu's Reactions row (scrolled to show the picked one).
+    std::vector<Rect> composeChipRects(Rect item, const std::vector<MessageLayout::Chip> &chips) const;
+    void drawChip(Rect r, const MessageLayout::Chip &c, bool focus);
+    void startReply(size_t layout);  // shows the "Replying to" bar
+    void toggleReaction(size_t layout, size_t chip);
+    bool replying() const;  // the open channel's draft is a reply
+    Rect replyBarRect() const;
+    Rect cancelReplyRect() const;
     void openPicker();
     void pickerPick(int index);
     void handlePickerInput(u64 down, u64 held);

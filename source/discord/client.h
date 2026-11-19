@@ -65,7 +65,12 @@ public:
     // Milliseconds until slowmode lets us send in this channel (0 = now).
     uint64_t sendCooldownMs(const Channel &c);
     // Sends a message, with a file when upload is given (content may then be empty).
-    void sendMessage(Snowflake channel_id, const std::string &content, const Upload *upload = nullptr);
+    // reply_to: the message this replies to (0 for none).
+    void sendMessage(Snowflake channel_id, const std::string &content, const Upload *upload = nullptr,
+                     Snowflake reply_to = 0);
+    // Adds our reaction with this emoji, or takes it away if we already reacted.
+    void toggleReaction(Snowflake channel_id, Snowflake message_id, const Reaction &reaction);
+    Message *findMessage(Snowflake channel_id, Snowflake message_id);
     // Marks a channel as being viewed: subscribes to its guild's events.
     void focusChannel(Snowflake channel_id);
     std::string typingText(Snowflake channel_id);
@@ -77,6 +82,8 @@ public:
 
     // Called when Discord hands out a refreshed token (AUTH_TOKEN_REFRESH).
     std::function<void(const std::string &)> onTokenRefresh;
+    // Called with a short message when an action (like reacting) fails.
+    std::function<void(const std::string &)> onError;
 
     // GatewayListener
     void onDispatch(const std::string &type, const json::Value &d) override;
@@ -101,6 +108,7 @@ private:
     std::map<Snowflake, std::vector<std::pair<Snowflake, Typing>>> m_typing;
     std::map<Snowflake, std::set<Snowflake>> m_subscribed;  // guild -> channels
     std::set<Snowflake> m_fetchingChannels;
+    std::map<Snowflake, std::set<Snowflake>> m_memberRequested;  // guild -> users asked for
     std::map<Snowflake, uint64_t> m_lastSent;  // channel -> time, for slowmode
     uint32_t m_structureVersion = 0;
     uint32_t m_messagesVersion = 0;
@@ -112,6 +120,7 @@ private:
     void handleChannelDelete(const json::Value &d);
     void handleGuildCreate(const json::Value &d);
     void sortDms();
+    void requestMembers(Snowflake channel_id);
 };
 
 }  // namespace discord

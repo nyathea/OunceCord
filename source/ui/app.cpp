@@ -9,6 +9,7 @@
 #include "settings.h"
 #include "discord/cdn.h"
 #include "discord/emotes.h"
+#include "discord/reactions.h"
 #include "discord/rest.h"
 #include "util/sysinfo.h"
 #include "util/util.h"
@@ -89,6 +90,8 @@ constexpr float kHeaderH = 48;
 constexpr float kHintsH = 30;
 constexpr float kInputH = 66;  // text box plus the typing line under it
 constexpr float kInputBoxH = 40;
+constexpr float kReplyBarH = 28;  // "Replying to" strip above the text box
+constexpr float kChipH = 26, kChipGap = 6, kChipEmoji = 18;
 // Messages: avatar radius, its centre and the text column, from the pane's left edge.
 constexpr float kMsgAvatarR = 22, kMsgAvatarX = 38, kMsgTextX = 74;
 constexpr float kUserPanelH = 56;
@@ -161,6 +164,7 @@ bool App::init()
         logf("app: padPointerInitialize failed 0x%x; mouse mode unavailable", prc);
 #endif
 
+    m_client.onError = [this](const std::string &msg) { toast(msg, false); };
     m_client.onTokenRefresh = [this](const std::string &token) {
         m_token = token;
         config::saveToken(token);
@@ -500,7 +504,8 @@ void App::composeMessage()
     if (!ch || !c.canSend(*ch) || c.sendCooldownMs(*ch) > 0)
         return;
     std::string text = m_drafts[m_openChannel].text;
-    std::string header = "Message " + ch->label();
+    const Draft &dr = m_drafts[m_openChannel];
+    std::string header = dr.reply_to ? "Reply to @" + dr.reply_name : "Message " + ch->label();
     if (!promptText(header.c_str(), "Type a message", text, Kbd::Message))
         return;  // cancelled: keep the draft as it was
     m_drafts[m_openChannel].text = text;
@@ -531,35 +536,138 @@ Rect App::removeImageRect() const
 
 std::vector<App::ComposeAction> App::composeActions()
 {
-    std::vector<ComposeAction> a = {ComposeAction::Write, ComposeAction::Attach};
+    std::vector<ComposeAction> a;
+    Channel *ch = m_openChannel ? m_client.findChannel(m_openChannel) : nullptr;
+    if (!ch)
+        return a;
+    bool can_send = m_client.canSend(*ch);
+    int sel = m_pane == Pane::Messages ? selectedIndex() : -1;
+    if (sel >= 0 && !m_layout[sel].chips.empty())
+        a.push_back(ComposeAction::Reactions);
+    if (sel >= 0 && can_send && m_layout[sel].can_reply)
+        a.push_back(ComposeAction::Reply);
+    if (!can_send)
+        return a;
+    a.push_back(ComposeAction::Write);
+    a.push_back(ComposeAction::Attach);
     Draft *d = currentDraft();
     if (d && d->has_image)
         a.push_back(ComposeAction::Remove);
+    if (d && d->reply_to)
+        a.push_back(ComposeAction::CancelReply);
     return a;
 }
 
 Rect App::composeMenuRect(size_t count) const
 {
     Rect in = inputBoxRect();
+    if (replying())
+        in.y -= kReplyBarH;
     float h = count * 44.0f + 12;
-    return {in.x, in.y - 8 - h, 280, h};
+    return {in.x, in.y - 8 - h, 340, h};
 }
 
 void App::openComposeMenu()
 {
-    if (!m_openChannel)
-        return;
-    Channel *ch = m_client.findChannel(m_openChannel);
-    if (!ch || !m_client.canSend(*ch))
+    if (!m_openChannel || composeActions().empty())
         return;
     m_composeMenuOpen = true;
     m_composeMenuIndex = 0;
+    m_composeReactIndex = 0;
+}
+
+std::vector<Rect> App::composeChipRects(Rect item, const std::vector<MessageLayout::Chip> &chips) const
+{
+    std::vector<Rect> out;
+    float x = 0;
+    for (const auto &c : chips) {
+        out.push_back({x, item.y + (item.h - kChipH) / 2, c.w, kChipH});
+        x += c.w + kChipGap;
+    }
+    // Scroll so the picked chip fits.
+    float avail = item.w - 20, offset = 0;
+    int pick = std::clamp(m_composeReactIndex, 0, (int)out.size() - 1);
+    if (!out.empty() && out[pick].x + out[pick].w > avail)
+        offset = out[pick].x + out[pick].w - avail;
+    for (auto &r : out)
+        r.x += item.x + 10 - offset;
+    return out;
+}
+
+void App::drawChip(Rect r, const MessageLayout::Chip &c, bool focus)
+{
+    const Color tint(col::accent.r, col::accent.g, col::accent.b, 60);
+    if (c.reaction.me || focus) {
+        m_r.fillRoundRect(r, 8, focus ? col::bright : col::accent);
+        m_r.fillRoundRect({r.x + 1.5f, r.y + 1.5f, r.w - 3, r.h - 3}, 7, col::bg_messages);
+    }
+    m_r.fillRoundRect({r.x + 1.5f, r.y + 1.5f, r.w - 3, r.h - 3}, 7,
+                      c.reaction.me ? tint : hovering(r) ? col::hover : col::bg_input);
+    Rect e{r.x + 8, r.y + (r.h - kChipEmoji) / 2, kChipEmoji, kChipEmoji};
+    bool failed = false;
+    GLuint tex = c.image.empty() ? 0 : m_images.get(c.image, &failed);
+    if (tex) {
+        m_r.drawImage(tex, e, Shape::Rect);
+    } else if (failed || c.image.empty()) {
+        // No picture: the emote's name, or a placeholder for an emoji.
+        std::string name = c.reaction.emoji_id ? ":" + c.reaction.emoji_name + ":" : "?";
+        m_r.drawText(e.x, r.y + 5, m_r.ellipsize(name, 12, kChipEmoji + 4), 12, col::muted);
+    }
+    m_r.drawText(e.x + kChipEmoji + 6, r.y + 5, c.count, 13, c.reaction.me ? col::bright : col::text);
+}
+
+bool App::replying() const
+{
+    auto it = m_openChannel ? m_drafts.find(m_openChannel) : m_drafts.end();
+    return it != m_drafts.end() && it->second.reply_to;
+}
+
+Rect App::replyBarRect() const
+{
+    Rect in = inputBoxRect();
+    return {in.x, in.y - 4 - kReplyBarH, in.w, kReplyBarH};
+}
+
+Rect App::cancelReplyRect() const
+{
+    Rect b = replyBarRect();
+    return {b.x + b.w - 32, b.y + 2, 26, b.h - 4};
+}
+
+void App::startReply(size_t layout)
+{
+    if (layout >= m_layout.size() || !m_layout[layout].can_reply || !canSendNow())
+        return;
+    Draft &d = m_drafts[m_openChannel];
+    d.reply_to = m_layout[layout].id;
+    d.reply_name = m_layout[layout].author;
+}
+
+void App::toggleReaction(size_t layout, size_t chip)
+{
+    if (layout >= m_layout.size() || chip >= m_layout[layout].chips.size() || !m_layout[layout].id)
+        return;
+    m_client.toggleReaction(m_openChannel, m_layout[layout].id, m_layout[layout].chips[chip].reaction);
 }
 
 void App::composeMenuChoose(ComposeAction a)
 {
     m_composeMenuOpen = false;
     switch (a) {
+    case ComposeAction::Reply:
+        if (int sel = selectedIndex(); sel >= 0)
+            startReply((size_t)sel);
+        break;
+    case ComposeAction::Reactions:
+        if (int sel = selectedIndex(); sel >= 0) {
+            toggleReaction((size_t)sel, (size_t)std::max(0, m_composeReactIndex));
+            m_composeMenuOpen = true;  // stay open to change more
+        }
+        break;
+    case ComposeAction::CancelReply:
+        if (Draft *d = currentDraft())
+            d->reply_to = 0;
+        break;
     case ComposeAction::Write: composeMessage(); break;
     case ComposeAction::Attach: openPicker(); break;
     case ComposeAction::Remove:
@@ -580,7 +688,20 @@ void App::handleComposeMenuInput(u64 down)
         m_composeMenuIndex = std::max(0, m_composeMenuIndex - 1);
     if (down & (HidNpadButton_AnyDown))
         m_composeMenuIndex = std::min((int)actions.size() - 1, m_composeMenuIndex + 1);
+    if (actions.empty()) {
+        m_composeMenuOpen = false;
+        return;
+    }
     m_composeMenuIndex = std::clamp(m_composeMenuIndex, 0, (int)actions.size() - 1);
+    if (actions[m_composeMenuIndex] == ComposeAction::Reactions) {
+        int sel = selectedIndex();
+        int n = sel >= 0 ? (int)m_layout[sel].chips.size() : 0;
+        if (down & HidNpadButton_AnyLeft)
+            m_composeReactIndex--;
+        if (down & HidNpadButton_AnyRight)
+            m_composeReactIndex++;
+        m_composeReactIndex = std::clamp(m_composeReactIndex, 0, std::max(0, n - 1));
+    }
     if (down & HidNpadButton_A)
         composeMenuChoose(actions[m_composeMenuIndex]);
 }
@@ -592,16 +713,39 @@ void App::drawComposeMenu()
     m_r.fillRoundRect({r.x - 1, r.y - 1, r.w + 2, r.h + 2}, 9, col::bg_guilds);
     m_r.fillRoundRect(r, 8, col::bg_panel);
     Draft *d = currentDraft();
+    int sel = selectedIndex();
     for (size_t i = 0; i < actions.size(); i++) {
         Rect it{r.x + 6, r.y + 6 + i * 44.0f, r.w - 12, 44};
+        ComposeAction a = actions[i];
         bool focus = m_mouseMode ? hovering(it) : (int)i == m_composeMenuIndex;
+        bool danger = a == ComposeAction::Remove || a == ComposeAction::CancelReply;
+        if (a == ComposeAction::Reactions) {
+            // A row of the message's reactions; (A) or a click toggles one.
+            if (sel < 0)
+                continue;
+            if (focus && !m_mouseMode)
+                m_r.fillRoundRect(it, 6, col::selected);
+            const auto &chips = m_layout[sel].chips;
+            auto rects = composeChipRects(it, chips);
+            m_r.pushClip(it);
+            for (size_t c = 0; c < chips.size(); c++)
+                drawChip(rects[c], chips[c], focus && !m_mouseMode && (int)c == m_composeReactIndex);
+            m_r.popClip();
+            continue;
+        }
         if (focus)
-            m_r.fillRoundRect(it, 6, actions[i] == ComposeAction::Remove ? col::danger : col::accent);
-        const char *label = actions[i] == ComposeAction::Write    ? (d && !d->text.empty() ? "Edit message" : "Write a message")
-                            : actions[i] == ComposeAction::Attach ? (d && d->has_image ? "Change picture" : "Attach a picture")
-                                                                  : "Remove picture";
-        Color fg = focus ? col::on_accent : actions[i] == ComposeAction::Remove ? col::danger : col::text;
-        m_r.drawText(it.x + 14, it.y + 12, label, 16, fg);
+            m_r.fillRoundRect(it, 6, danger ? col::danger : col::accent);
+        std::string label;
+        switch (a) {
+        case ComposeAction::Reply: label = "Reply to @" + (sel >= 0 ? m_layout[sel].author : std::string()); break;
+        case ComposeAction::Write: label = d && !d->text.empty() ? "Edit message" : "Write a message"; break;
+        case ComposeAction::Attach: label = d && d->has_image ? "Change picture" : "Attach a picture"; break;
+        case ComposeAction::Remove: label = "Remove picture"; break;
+        case ComposeAction::CancelReply: label = "Cancel reply"; break;
+        case ComposeAction::Reactions: break;
+        }
+        Color fg = focus ? col::on_accent : danger ? col::danger : col::text;
+        m_r.drawText(it.x + 14, it.y + 12, m_r.ellipsize(label, 16, it.w - 28), 16, fg);
     }
 }
 
@@ -827,11 +971,11 @@ void App::sendDraft()
             m_composeErrorUntil = m_frameTime + 5000;
             return;
         }
-        m_client.sendMessage(m_openChannel, text, &up);
+        m_client.sendMessage(m_openChannel, text, &up, it->second.reply_to);
     } else {
         if (text.empty())
             return;
-        m_client.sendMessage(m_openChannel, text);
+        m_client.sendMessage(m_openChannel, text, nullptr, it->second.reply_to);
     }
     m_drafts.erase(it);
     clearMessageSelection();
@@ -1082,7 +1226,7 @@ int App::hitChannelRow(float x, float y) const
 Rect App::jumpPillRect() const
 {
     float x = kGuildBarW + kChannelW, w = Renderer::kWidth - x;
-    float bottom = Renderer::kHeight - kHintsH - kInputH;
+    float bottom = Renderer::kHeight - kHintsH - kInputH - (replying() ? kReplyBarH : 0);
     return {x + w / 2 - 80, bottom - 36, 160, 28};
 }
 
@@ -1129,10 +1273,44 @@ void App::tapAt(float x, float y)
         auto actions = composeActions();
         Rect r = composeMenuRect(actions.size());
         m_composeMenuOpen = false;
-        for (size_t i = 0; i < actions.size(); i++)
-            if (Rect{r.x + 6, r.y + 6 + i * 44.0f, r.w - 12, 44}.contains(x, y))
+        for (size_t i = 0; i < actions.size(); i++) {
+            Rect it{r.x + 6, r.y + 6 + i * 44.0f, r.w - 12, 44};
+            if (!it.contains(x, y))
+                continue;
+            if (actions[i] == ComposeAction::Reactions) {
+                int sel = selectedIndex();
+                if (sel < 0)
+                    break;
+                auto rects = composeChipRects(it, m_layout[sel].chips);
+                for (size_t c = 0; c < rects.size(); c++)
+                    if (rects[c].contains(x, y)) {
+                        m_composeReactIndex = (int)c;
+                        composeMenuChoose(actions[i]);
+                    }
+                m_composeMenuOpen = true;
+            } else {
                 composeMenuChoose(actions[i]);
+            }
+        }
         return;
+    }
+    if (m_screen == Screen::Main && m_openChannel) {
+        if (replying() && cancelReplyRect().contains(x, y)) {
+            if (Draft *d = currentDraft())
+                d->reply_to = 0;
+            return;
+        }
+        if (m_replyButtonLayout >= 0 && m_replyButton.contains(x, y)) {
+            m_pane = Pane::Messages;
+            startReply((size_t)m_replyButtonLayout);
+            return;
+        }
+        for (const ReactionHit &h : m_reactionHits)
+            if (h.rect.contains(x, y)) {
+                m_pane = Pane::Messages;
+                toggleReaction(h.layout, h.chip);
+                return;
+            }
     }
     if (m_screen == Screen::Main) {
         for (const ImageHit &h : m_imageHits) {
@@ -1192,6 +1370,15 @@ void App::tapAt(float x, float y)
             currentDraft()->has_image = false;
         else if (m_openChannel && inputBoxRect().contains(x, y))
             composeMessage();
+        else if (m_openChannel)
+            // Tapping a message highlights it (showing its Reply button).
+            for (const auto &mh : m_messageHits)
+                if (mh.first.contains(x, y) && mh.second < m_layout.size()) {
+                    m_selActive = true;
+                    m_selId = m_layout[mh.second].id;
+                    m_selHint = mh.second;
+                    break;
+                }
     }
 }
 
@@ -2112,7 +2299,13 @@ discord::MentionLookup App::mentionLookup(const Message *m)
     discord::MentionLookup lk;
     Channel *ch = m_openChannel ? m_client.findChannel(m_openChannel) : nullptr;
     Guild *g = ch && ch->guild_id ? m_client.findGuild(ch->guild_id) : nullptr;
-    lk.user = [this, m, ch](uint64_t id, std::string &name) {
+    lk.user = [this, m, ch, g](uint64_t id, std::string &name) {
+        if (g)
+            if (const Member *mem = g->member(id))
+                if (!mem->nick.empty()) {
+                    name = mem->nick;
+                    return true;
+                }
         if (m)
             if (const std::string *n = m->mentionName(id)) {
                 name = *n;
@@ -2172,6 +2365,8 @@ void App::rebuildLayout(float width)
     const float lh = m_r.lineHeight(kTextSize);
     Snowflake prev_author = 0;
     uint64_t prev_ms = 0;
+    Channel *open_ch = m_client.findChannel(m_openChannel);
+    const Guild *guild = open_ch && open_ch->guild_id ? m_client.findGuild(open_ch->guild_id) : nullptr;
     for (const Message &m : cm.messages) {
         MessageLayout L;
         L.id = m.id;
@@ -2180,8 +2375,10 @@ void App::rebuildLayout(float width)
         L.show_header = m.author.id != prev_author || ms - prev_ms > kGroupWindowMs || m.has_reply || system;
         prev_author = m.author.id;
         prev_ms = ms;
-        L.author = m.author.displayName();
+        L.author = guild && !m.webhook ? guild->nameFor(m.author) : m.author.displayName();
         L.author_id = m.author.id;
+        uint32_t role_color = guild && !m.webhook ? guild->colorFor(m.author.id) : 0;
+        L.author_color = role_color ? Color::hex(role_color) : col::bright;
         L.avatar = discord::cdn::avatarPath(m.author);
         L.time = m.id ? formatTime(ms / 1000) : "";
         L.text_color = m.failed ? col::danger : m.pending ? col::faint : col::text;
@@ -2282,7 +2479,12 @@ void App::rebuildLayout(float width)
             }
         }
         if (m.has_reply) {
-            std::string r = (m.reply_author.empty() ? "" : "@" + m.reply_author + " ") +
+            std::string reply_name = m.reply_author;
+            if (guild)
+                if (const Member *rm = guild->member(m.reply_author_id))
+                    if (!rm->nick.empty())
+                        reply_name = rm->nick;
+            std::string r = (reply_name.empty() ? "" : "@" + reply_name + " ") +
                             discord::emotesAsText(discord::resolveMentions(m.reply_content, mentionLookup(&m), false).text);
             for (auto &c : r)
                 if (c == '\n')
@@ -2340,6 +2542,27 @@ void App::rebuildLayout(float width)
         if (m.failed)
             L.extras.push_back({m.error.empty() ? "Failed to send." : "Failed to send: " + m.error, col::danger});
 
+        L.can_reply = m.id && !m.pending && !m.failed && !system;
+        {
+            float cx = 0;
+            int row = 0;
+            for (const auto &r : m.reactions) {
+                MessageLayout::Chip c;
+                c.reaction = r;
+                c.image = discord::reactionImage(r, 48);
+                c.count = std::to_string(r.count);
+                c.w = 8 + kChipEmoji + 6 + m_r.measureText(c.count, 13) + 9;
+                if (cx > 0 && cx + c.w > text_w) {
+                    cx = 0;
+                    row++;
+                }
+                c.x = cx;
+                c.row = row;
+                cx += c.w + kChipGap;
+                L.chips.push_back(std::move(c));
+            }
+        }
+
         float h = 0;
         if (L.show_header)
             h += 14 + lh;  // gap + name row
@@ -2351,6 +2574,8 @@ void App::rebuildLayout(float width)
         if (!L.images.empty() && !L.lines.empty())
             h += 4;
         h += L.extras.size() * (kSmallSize * 1.5f);
+        if (!L.chips.empty())
+            h += 4 + (L.chips.back().row + 1) * (kChipH + kChipGap);
         h += L.show_header ? 4 : 2;
         if (L.show_header)  // room for the avatar
             h = std::max(h, 14 + (L.reply.empty() ? 0.0f : 20.0f) + 19 + kMsgAvatarR + 6);
@@ -2388,6 +2613,9 @@ void App::drawMessages(Rect area)
     }
 
     Rect view{area.x, area.y + kHeaderH, area.w, area.h - kHeaderH - kInputH};
+    const bool reply_bar = replying();
+    if (reply_bar)
+        view.h -= kReplyBarH;
     auto &cm = m_client.messages(m_openChannel);
     rebuildLayout(area.w);
 
@@ -2427,12 +2655,24 @@ void App::drawMessages(Rect area)
     const float lh = m_r.lineHeight(kTextSize);
     const float tx = view.x + kMsgTextX;
     m_imageHits.clear();
+    m_reactionHits.clear();
+    m_messageHits.clear();
+    m_replyButtonLayout = -1;
+    const bool can_reply_here = m_client.canSend(*ch);
     for (size_t li = 0; li < m_layout.size(); li++) {
         const MessageLayout &L = m_layout[li];
         if (y + L.height < view.y || y > view.y + view.h) {
             y += L.height;
             continue;
         }
+        const float msg_top = y;
+        {
+            float top = std::max(y, view.y), bottom = std::min(y + L.height, view.y + view.h);
+            m_messageHits.push_back({{view.x, top, view.w, bottom - top}, li});
+        }
+        const bool hovered = m_mouseMode && !m_composeMenuOpen && hovering(m_messageHits.back().first);
+        if (hovered && (int)li != sel)
+            m_r.fillRect({view.x, y, view.w, L.height}, Color(0, 0, 0, 18));
         float cy = y;
         if ((int)li == sel) {
             m_r.fillRect({view.x, y, view.w, L.height}, col::overlay);
@@ -2451,7 +2691,7 @@ void App::drawMessages(Rect area)
                 cy += 20;
             }
             drawAvatar(view.x + kMsgAvatarX, cy + 19, kMsgAvatarR, L.author, L.author_id, L.avatar);
-            float nw = m_r.drawText(tx, cy, m_r.ellipsize(L.author, kTextSize, view.w / 2), kTextSize, col::bright);
+            float nw = m_r.drawText(tx, cy, m_r.ellipsize(L.author, kTextSize, view.w / 2), kTextSize, L.author_color);
             m_r.drawText(tx + nw + 10, cy + 3, L.time, 12, col::faint);
             cy += lh;
         }
@@ -2518,6 +2758,31 @@ void App::drawMessages(Rect area)
             m_r.drawText(tx, cy + 2, e.first, kSmallSize, e.second);
             cy += kSmallSize * 1.5f;
         }
+        if (!L.chips.empty()) {
+            cy += 4;
+            for (size_t ci = 0; ci < L.chips.size(); ci++) {
+                const auto &c = L.chips[ci];
+                Rect r{tx + c.x, cy + c.row * (kChipH + kChipGap), c.w, kChipH};
+                if (r.y + r.h < view.y || r.y > view.y + view.h)
+                    continue;
+                drawChip(r, c, false);
+                float top = std::max(r.y, view.y), bottom = std::min(r.y + r.h, view.y + view.h);
+                m_reactionHits.push_back({{r.x, top, r.w, bottom - top}, li, ci});
+            }
+        }
+        // Reply button on the highlighted or hovered message.
+        if (L.can_reply && can_reply_here && ((int)li == sel || hovered)) {
+            const char *label = m_mouseMode || m_touching ? "Reply" : "(X) Reply";
+            float bw = m_r.measureText(label, 13) + 24;
+            Rect b{view.x + view.w - bw - 16, std::max(msg_top + 4, view.y + 4), bw, 26};
+            if (b.y + b.h <= view.y + view.h) {
+                m_r.fillRoundRect({b.x - 1, b.y - 1, b.w + 2, b.h + 2}, 7, col::bg_guilds);
+                m_r.fillRoundRect(b, 6, hovering(b) ? col::accent : col::bg_panel);
+                m_r.drawText(b.x + 12, b.y + 5, label, 13, hovering(b) ? col::on_accent : col::text);
+                m_replyButton = b;
+                m_replyButtonLayout = (int)li;
+            }
+        }
         y += L.height;
     }
     if (!cm.error.empty())
@@ -2530,6 +2795,21 @@ void App::drawMessages(Rect area)
         m_r.fillRoundRect(pill, 14, hovering(pill) ? col::accent_hover : col::accent);
         const char *t = m_mouseMode ? "Jump to latest" : "(RS) Jump to latest";
         m_r.drawText(pill.x + pill.w / 2 - m_r.measureText(t, 13) / 2, pill.y + 6, t, 13, col::on_accent);
+    }
+
+    // "Replying to @name", with an x to cancel.
+    if (reply_bar) {
+        const Draft *d = currentDraft();
+        Rect b = replyBarRect();
+        m_r.fillRect({view.x, b.y, view.w, b.h + 4}, col::bg_messages);
+        m_r.fillRoundRect(b, 6, col::bg_panel);
+        float w = m_r.drawText(b.x + 12, b.y + 6, "Replying to ", 13, col::muted);
+        m_r.drawText(b.x + 12 + w, b.y + 6, m_r.ellipsize("@" + d->reply_name, 13, b.w - w - 60), 13, col::bright);
+        Rect x = cancelReplyRect();
+        if (hovering(x))
+            m_r.fillRoundRect(x, 5, col::hover);
+        const char *mark = "\u00d7";
+        m_r.drawText(x.x + x.w / 2 - m_r.measureText(mark, 18) / 2, x.y + 1, mark, 18, col::muted);
     }
 
     // Input bar: the draft (or a placeholder) and a send button.
@@ -2801,7 +3081,7 @@ void App::drawHints(Rect area)
     {
         int sel = selectedIndex();
         bool image = sel >= 0 ? !m_layout[sel].images.empty() : !m_imageHits.empty();
-        hints = std::string(image ? "(A) View image   " : "") + "(X) Write/attach   (Y) Send   (Up/Down/RS) Select   (ZL/ZR) Page   " +
+        hints = std::string(image ? "(A) View image   " : "") + (sel >= 0 ? "(X) Reply/react/write" : "(X) Write/attach") + "   (Y) Send   (Up/Down/RS) Select   (ZL/ZR) Page   " +
                 (sel >= 0 ? "(RS click) Latest   " : "") + "(B) Back";
     }
         break;

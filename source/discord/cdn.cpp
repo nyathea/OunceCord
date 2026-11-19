@@ -80,6 +80,9 @@ bool splitImageUrl(const std::string &url, std::string &host, std::string &path)
     path = slash == std::string::npos ? "/" : url.substr(slash);
     for (char &c : host)
         c = (char)tolower((unsigned char)c);
+    // Twemoji pictures for standard emoji reactions, and nothing else there.
+    if (host == "cdn.jsdelivr.net")
+        return path.compare(0, 20, "/gh/jdecked/twemoji@") == 0;
     return isImageHost(host);
 }
 

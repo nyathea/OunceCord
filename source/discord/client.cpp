@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "discord/client.h"
 
+#include "discord/reactions.h"
+
 #include <algorithm>
 
 #include <switch.h>
@@ -131,6 +133,7 @@ void Client::handleReady(const json::Value &d)
     m_dms.clear();
     m_messages.clear();
     m_subscribed.clear();
+    m_memberRequested.clear();
 
     std::vector<User> users;
     for (const auto &u : d["users"].items())
@@ -156,6 +159,10 @@ void Client::handleReady(const json::Value &d)
         };
         if (!findRoles(merged[i]))
             findRoles(guilds[i]["members"]);
+        for (const auto &m : merged[i].items())
+            g.setMember(m);
+        for (const auto &m : guilds[i]["members"].items())
+            g.setMember(m);
         m_guilds.push_back(std::move(g));
     }
 
@@ -208,6 +215,7 @@ void Client::handleGuildCreate(const json::Value &d)
     g->applyJson(d);
     g->my_roles = roles;
     for (const auto &m : d["members"].items()) {
+        g->setMember(m);
         if (m["user"]["id"].asId() == m_me.id) {
             g->my_roles.clear();
             for (const auto &r : m["roles"].items())
@@ -258,6 +266,9 @@ void Client::handleChannelDelete(const json::Value &d)
 void Client::handleMessageCreate(const json::Value &d)
 {
     Message m = Message::fromJson(d);
+    if (d["member"].isObject())
+        if (Guild *g = findGuild(m.guild_id))
+            g->setMember(d["member"], m.author.id);
     if (Channel *c = findChannel(m.channel_id)) {
         c->last_message_id = m.id;
         if (c->isDm()) {
@@ -331,6 +342,20 @@ void Client::onDispatch(const std::string &type, const json::Value &d)
                 m_messagesVersion++;
             }
         }
+    } else if (type == "MESSAGE_REACTION_ADD" || type == "MESSAGE_REACTION_REMOVE" ||
+               type == "MESSAGE_REACTION_REMOVE_ALL" || type == "MESSAGE_REACTION_REMOVE_EMOJI") {
+        if (Message *m = findMessage(d["channel_id"].asId(), d["message_id"].asId())) {
+            bool by_me = d["user_id"].asId() == m_me.id;
+            if (type == "MESSAGE_REACTION_ADD")
+                discord::reactionAdded(*m, d["emoji"], by_me);
+            else if (type == "MESSAGE_REACTION_REMOVE")
+                discord::reactionRemoved(*m, d["emoji"], by_me);
+            else if (type == "MESSAGE_REACTION_REMOVE_ALL")
+                m->reactions.clear();
+            else
+                discord::reactionCleared(*m, d["emoji"]);
+            m_messagesVersion++;
+        }
     } else if (type == "MESSAGE_DELETE") {
         auto it = m_messages.find(d["channel_id"].asId());
         if (it == m_messages.end())
@@ -381,14 +406,35 @@ void Client::onDispatch(const std::string &type, const json::Value &d)
                 g->roles.emplace_back();
                 role = &g->roles.back();
             }
-            role->id = rid;
-            role->name = r["name"].str();
-            role->permissions = r["permissions"].asId();
-            role->position = (int)r["position"].asInt();
-            role->color = (uint32_t)r["color"].asInt();
+            *role = Role::fromJson(r);
             m_structureVersion++;
+            m_messagesVersion++;
+        }
+    } else if (type == "GUILD_ROLE_DELETE") {
+        if (Guild *g = findGuild(d["guild_id"].asId())) {
+            Snowflake rid = d["role_id"].asId();
+            g->roles.erase(std::remove_if(g->roles.begin(), g->roles.end(),
+                                          [rid](const Role &r) { return r.id == rid; }),
+                           g->roles.end());
+            m_structureVersion++;
+            m_messagesVersion++;
+        }
+    } else if (type == "GUILD_MEMBERS_CHUNK") {
+        if (Guild *g = findGuild(d["guild_id"].asId())) {
+            for (const auto &m : d["members"].items())
+                g->setMember(m);
+            m_messagesVersion++;
+        }
+    } else if (type == "GUILD_MEMBER_ADD") {
+        if (Guild *g = findGuild(d["guild_id"].asId())) {
+            g->setMember(d);
+            m_messagesVersion++;
         }
     } else if (type == "GUILD_MEMBER_UPDATE") {
+        if (Guild *g = findGuild(d["guild_id"].asId())) {
+            g->setMember(d);
+            m_messagesVersion++;
+        }
         if (d["user"]["id"].asId() == m_me.id) {
             if (Guild *g = findGuild(d["guild_id"].asId())) {
                 g->my_roles.clear();
@@ -404,6 +450,8 @@ void Client::onDispatch(const std::string &type, const json::Value &d)
         std::string name;
         const auto &member = d["member"];
         if (member.isObject()) {
+            if (Guild *g = findGuild(d["guild_id"].asId()))
+                g->setMember(member, uid);
             name = member["nick"].str();
             if (name.empty())
                 name = User::fromJson(member["user"]).displayName();
@@ -484,6 +532,7 @@ void Client::loadMessages(Snowflake channel_id)
                                cm.messages.push_back(std::move(m));
                        cm.reached_start = v.size() < 50;
                        cm.loaded = true;
+                       requestMembers(channel_id);
                        m_messagesVersion++;
                    });
 }
@@ -527,11 +576,65 @@ void Client::loadOlder(Snowflake channel_id)
                            older.push_back(Message::fromJson(v[i]));
                        cm.messages.insert(cm.messages.begin(), older.begin(), older.end());
                        cm.reached_start = v.size() < 50;
+                       requestMembers(channel_id);
                        m_messagesVersion++;
                    });
 }
 
-void Client::sendMessage(Snowflake channel_id, const std::string &content, const Upload *upload)
+Message *Client::findMessage(Snowflake channel_id, Snowflake message_id)
+{
+    auto it = m_messages.find(channel_id);
+    if (it == m_messages.end() || !message_id)
+        return nullptr;
+    for (auto &m : it->second.messages)
+        if (m.id == message_id)
+            return &m;
+    return nullptr;
+}
+
+void Client::toggleReaction(Snowflake channel_id, Snowflake message_id, const Reaction &reaction)
+{
+    Message *m = findMessage(channel_id, message_id);
+    if (!m)
+        return;
+    // Show the change now; the gateway's echo of it is ignored, and a
+    // failed request puts it back.
+    json::Value emoji = json::Value::object();
+    emoji.set("id", reaction.emoji_id ? json::Value::string(std::to_string(reaction.emoji_id)) : json::Value());
+    emoji.set("name", json::Value::string(reaction.emoji_name));
+    emoji.set("animated", json::Value::boolean(reaction.animated));
+    bool adding = !reaction.me;
+    if (adding)
+        discord::reactionAdded(*m, emoji, true);
+    else
+        discord::reactionRemoved(*m, emoji, true);
+    m_messagesVersion++;
+
+    std::string path = "/channels/" + std::to_string(channel_id) + "/messages/" + std::to_string(message_id) +
+                       "/reactions/" + discord::reactionRoute(reaction) + "/@me";
+    if (adding)
+        path += "?location=Message%20Reaction%20Picker&type=0";
+    std::weak_ptr<bool> alive = m_alive;
+    m_rest.request(adding ? "PUT" : "DELETE", path, "",
+                   [this, alive, channel_id, message_id, emoji, adding](const HttpResponse &res) {
+                       if (alive.expired() || res.status == 204 || res.status == 200)
+                           return;
+                       logf("client: reaction %s failed (HTTP %d)", adding ? "add" : "remove", res.status);
+                       if (Message *m = findMessage(channel_id, message_id)) {
+                           if (adding)
+                               discord::reactionRemoved(*m, emoji, true);
+                           else
+                               discord::reactionAdded(*m, emoji, true);
+                           m_messagesVersion++;
+                       }
+                       if (onError)
+                           onError(res.status == 403 ? "You can't react in this channel."
+                                                     : "Couldn't change the reaction.");
+                   });
+}
+
+void Client::sendMessage(Snowflake channel_id, const std::string &content, const Upload *upload,
+                         Snowflake reply_to)
 {
     if (content.empty() && !upload)
         return;
@@ -558,6 +661,13 @@ void Client::sendMessage(Snowflake channel_id, const std::string &content, const
     pending.pending = true;
     if (upload)
         pending.uploading = upload->filename;
+    if (const Message *ref = reply_to ? findMessage(channel_id, reply_to) : nullptr) {
+        pending.has_reply = true;
+        pending.reply_author = ref->author.displayName();
+        pending.reply_author_id = ref->author.id;
+        pending.reply_content = ref->content;
+        pending.mention_names = ref->mention_names;
+    }
     cm.messages.push_back(pending);
     m_messagesVersion++;
 
@@ -567,6 +677,15 @@ void Client::sendMessage(Snowflake channel_id, const std::string &content, const
     body.set("tts", json::Value::boolean(false));
     body.set("flags", json::Value::number((int64_t)0));
     body.set("mobile_network_type", json::Value::string("unknown"));
+    if (reply_to) {
+        json::Value ref = json::Value::object();
+        ref.set("channel_id", json::Value::string(std::to_string(channel_id)));
+        ref.set("message_id", json::Value::string(std::to_string(reply_to)));
+        if (Channel *c = findChannel(channel_id))
+            if (c->guild_id)
+                ref.set("guild_id", json::Value::string(std::to_string(c->guild_id)));
+        body.set("message_reference", std::move(ref));
+    }
     std::string request_body;
     HttpHeaders extra = {{"X-Context-Properties", base64Encode(std::string("{\"location\":\"chat_input\"}"))}};
     if (upload) {
@@ -659,6 +778,49 @@ void Client::focusChannel(Snowflake channel_id)
     payload.set("op", Value::number((int64_t)37));
     payload.set("d", std::move(d));
     m_gateway.send(std::move(payload));
+}
+
+void Client::requestMembers(Snowflake channel_id)
+{
+    // Messages from the REST API carry no member objects, so ask the gateway
+    // (op 8, request guild members) for the authors we don't know yet: their
+    // nicknames and roles come back in GUILD_MEMBERS_CHUNK.
+    Channel *c = findChannel(channel_id);
+    Guild *g = c && c->guild_id ? findGuild(c->guild_id) : nullptr;
+    if (!g)
+        return;
+    std::set<Snowflake> &asked = m_memberRequested[g->id];
+    std::vector<Snowflake> want;
+    auto consider = [&](Snowflake uid) {
+        if (uid && !g->member(uid) && !asked.count(uid)) {
+            asked.insert(uid);
+            want.push_back(uid);
+        }
+    };
+    for (const auto &m : m_messages[channel_id].messages) {
+        if (m.webhook)
+            continue;  // webhooks aren't members
+        consider(m.author.id);
+        consider(m.reply_author_id);
+    }
+    using json::Value;
+    for (size_t i = 0; i < want.size(); i += 100) {
+        Value ids = Value::array();
+        for (size_t j = i; j < want.size() && j < i + 100; j++)
+            ids.push(Value::string(std::to_string(want[j])));
+        Value guild_ids = Value::array();
+        guild_ids.push(Value::string(std::to_string(g->id)));
+        Value d = Value::object();
+        d.set("guild_id", std::move(guild_ids));
+        d.set("user_ids", std::move(ids));
+        d.set("presences", Value::boolean(false));
+        Value payload = Value::object();
+        payload.set("op", Value::number((int64_t)8));
+        payload.set("d", std::move(d));
+        m_gateway.send(std::move(payload));
+    }
+    if (!want.empty())
+        logf("client: asked for %zu members of guild %llu", want.size(), (unsigned long long)g->id);
 }
 
 void Client::reloadMessages(Snowflake channel_id)

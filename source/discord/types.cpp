@@ -107,15 +107,8 @@ void Guild::applyJson(const json::Value &v)
     unavailable = v["unavailable"].asBool();
     if (v.has("roles")) {
         roles.clear();
-        for (const auto &r : v["roles"].items()) {
-            Role role;
-            role.id = r["id"].asId();
-            role.name = r["name"].str();
-            role.permissions = r["permissions"].asId();
-            role.position = (int)r["position"].asInt();
-            role.color = (uint32_t)r["color"].asInt();
-            roles.push_back(role);
-        }
+        for (const auto &r : v["roles"].items())
+            roles.push_back(Role::fromJson(r));
     }
     if (v.has("channels")) {
         channels.clear();
@@ -136,6 +129,63 @@ void Guild::applyJson(const json::Value &v)
         }
     }
     sortChannels();
+}
+
+Role Role::fromJson(const json::Value &r)
+{
+    Role role;
+    role.id = r["id"].asId();
+    role.name = r["name"].str();
+    role.permissions = r["permissions"].asId();
+    role.position = (int)r["position"].asInt();
+    role.color = (uint32_t)r["color"].asInt();
+    // Gradient roles: use the first colour.
+    if (!role.color)
+        role.color = (uint32_t)r["colors"]["primary_color"].asInt();
+    return role;
+}
+
+void Guild::setMember(const json::Value &m, Snowflake user_id)
+{
+    if (!m.isObject())
+        return;
+    Snowflake uid = m.has("user") ? m["user"]["id"].asId() : m.has("user_id") ? m["user_id"].asId() : 0;
+    if (!uid)
+        uid = user_id;
+    if (!uid)
+        return;
+    Member &mem = members[uid];
+    mem.nick = m["nick"].str();
+    if (m.has("roles")) {
+        mem.roles.clear();
+        for (const auto &r : m["roles"].items())
+            mem.roles.push_back(r.asId());
+    }
+}
+
+const Member *Guild::member(Snowflake user_id) const
+{
+    auto it = members.find(user_id);
+    return it == members.end() ? nullptr : &it->second;
+}
+
+std::string Guild::nameFor(const User &u) const
+{
+    const Member *m = member(u.id);
+    return m && !m->nick.empty() ? m->nick : u.displayName();
+}
+
+uint32_t Guild::colorFor(Snowflake user_id) const
+{
+    const Member *m = member(user_id);
+    if (!m)
+        return 0;
+    const Role *best = nullptr;
+    for (Snowflake rid : m->roles)
+        for (const auto &r : roles)
+            if (r.id == rid && r.color && (!best || r.position > best->position))
+                best = &r;
+    return best ? best->color : 0;
 }
 
 Channel *Guild::findChannel(Snowflake cid)
@@ -266,6 +316,9 @@ Message Message::fromJson(const json::Value &v)
     m.id = v["id"].asId();
     m.channel_id = v["channel_id"].asId();
     m.guild_id = v["guild_id"].asId();
+    m.webhook = v.has("webhook_id") && !v["webhook_id"].isNull();
+    for (const auto &r : v["reactions"].items())
+        m.reactions.push_back(Reaction::fromJson(r));
     m.author = User::fromJson(v["author"]);
     m.content = v["content"].str();
     m.type = (int)v["type"].asInt();
@@ -329,7 +382,9 @@ Message Message::fromJson(const json::Value &v)
     const auto &ref = v["referenced_message"];
     if (ref.isObject()) {
         m.has_reply = true;
-        m.reply_author = User::fromJson(ref["author"]).displayName();
+        User ra = User::fromJson(ref["author"]);
+        m.reply_author = ra.displayName();
+        m.reply_author_id = ra.id;
         m.reply_content = ref["content"].str();
         parseMentions(ref["mentions"], m.mention_names, nullptr);
     } else if (v["message_reference"].isObject() && m.type == 19) {

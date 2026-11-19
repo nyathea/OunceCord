@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,7 +53,15 @@ struct Role {
     std::string name;
     uint64_t permissions = 0;
     int position = 0;
-    uint32_t color = 0;
+    uint32_t color = 0;  // 0 = no colour
+
+    static Role fromJson(const json::Value &v);
+};
+
+// A user's membership of one server: their server nickname and roles.
+struct Member {
+    std::string nick;
+    std::vector<Snowflake> roles;
 };
 
 struct Overwrite {
@@ -99,6 +108,8 @@ struct Guild {
     std::vector<Role> roles;
     std::vector<Channel> channels;  // sorted for display by sortChannels
     std::vector<Snowflake> my_roles;
+    // Members we have seen (message authors, member chunks...), by user id.
+    std::map<Snowflake, Member> members;
     bool unavailable = false;
 
     void applyJson(const json::Value &v);
@@ -108,6 +119,15 @@ struct Guild {
     // Sorts channels as the official client does: categories by position,
     // with their children beneath them, uncategorised channels first.
     void sortChannels();
+
+    // Stores a member object (from MESSAGE_CREATE, GUILD_MEMBER_UPDATE,
+    // GUILD_MEMBERS_CHUNK...). user_id is used when the object has no user.
+    void setMember(const json::Value &m, Snowflake user_id = 0);
+    const Member *member(Snowflake user_id) const;
+    // The name to show for a user here: nickname, else display name.
+    std::string nameFor(const User &u) const;
+    // The colour of the user's highest coloured role, or 0.
+    uint32_t colorFor(Snowflake user_id) const;
 };
 
 struct Attachment {
@@ -143,6 +163,18 @@ struct EmbedImage {
 // The GIF file behind a Tenor/Giphy embed's MP4 URL, or empty.
 std::string gifvAnimatedUrl(const std::string &video_url);
 
+// A reaction under a message: one emoji, how many reacted with it, and
+// whether we did.
+struct Reaction {
+    Snowflake emoji_id = 0;  // custom emote, or 0 for a standard emoji
+    std::string emoji_name;  // emote name, or the emoji itself
+    bool animated = false;
+    int count = 0;
+    bool me = false;
+
+    static Reaction fromJson(const json::Value &v);
+};
+
 struct Message {
     Snowflake id = 0;
     Snowflake channel_id = 0;
@@ -151,6 +183,7 @@ struct Message {
     std::string content;
     int type = 0;
     bool edited = false;
+    bool webhook = false;  // sent by a webhook (no member behind it)
     std::vector<Attachment> attachments;
     int embed_count = 0;
     std::string embed_summary;  // title/description of the first embed
@@ -158,6 +191,7 @@ struct Message {
     // Replied-to message, if any.
     bool has_reply = false;
     std::string reply_author;
+    Snowflake reply_author_id = 0;
     std::string reply_content;
     // Who and what the message mentions. Names cover the reply preview's
     // mentions too: user id -> name (server nickname when known).
@@ -165,6 +199,7 @@ struct Message {
     std::vector<Snowflake> mention_users;  // this message's own user mentions
     std::vector<Snowflake> mention_roles;
     bool mention_everyone = false;
+    std::vector<Reaction> reactions;
     const std::string *mentionName(Snowflake id) const;
     // Local bookkeeping for messages we sent and are waiting on.
     std::string nonce;
