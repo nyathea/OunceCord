@@ -3,7 +3,7 @@ WIP Discord Client for Switch 2 (KaiHEN)
 
 > [!WARNING]
 >
-> All 3rd-party clients are technically against Discord's ToS and could result in your account being banned. while this app pretends to be Discord as much as possible. there is still a big risk.
+> All 3rd-party clients are technically against Discord's ToS. while this app pretends to be Discord as much as possible. there is still a big risk to using this.
 
 ## Current Features
 
