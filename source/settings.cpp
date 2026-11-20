@@ -13,6 +13,15 @@ const char *Settings::themeName(Theme t)
     }
 }
 
+const char *Settings::dateFormatName(DateFormat f)
+{
+    switch (f) {
+    case DateFormat::MDY: return "MM-DD-YYYY";
+    case DateFormat::DMY: return "DD-MM-YYYY";
+    default: return "YYYY-MM-DD";
+    }
+}
+
 std::string Settings::toJson() const
 {
     json::Value v = json::Value::object();
@@ -21,6 +30,10 @@ std::string Settings::toJson() const
     v.set("touch", json::Value::boolean(touch));
     v.set("qr_login", json::Value::boolean(qr_login));
     v.set("videos", json::Value::boolean(videos));
+    v.set("clock24", json::Value::boolean(clock24));
+    v.set("date_format", json::Value::string(date_format == DateFormat::MDY   ? "mdy"
+                                             : date_format == DateFormat::DMY ? "dmy"
+                                                                              : "ymd"));
     return v.dump();
 }
 
@@ -43,6 +56,13 @@ Settings Settings::fromJson(const std::string &text)
         s.qr_login = v["qr_login"].asBool();
     if (v["videos"].isBool())
         s.videos = v["videos"].asBool();
+    if (v["clock24"].isBool())
+        s.clock24 = v["clock24"].asBool();
+    std::string df = v["date_format"].str();
+    if (df == "mdy")
+        s.date_format = DateFormat::MDY;
+    else if (df == "dmy")
+        s.date_format = DateFormat::DMY;
     return s;
 }
 

@@ -400,6 +400,10 @@ Message Message::fromJson(const json::Value &v)
         m.thread_id = v["thread"]["id"].asId();
         m.thread_name = v["thread"]["name"].str();
         m.thread_count = (int)v["thread"]["message_count"].asInt();
+    } else if (m.type == 18 && v["message_reference"].isObject()) {
+        // "X started a thread": the reference points at the thread.
+        m.thread_id = v["message_reference"]["channel_id"].asId();
+        m.thread_name = m.content;
     }
     m.embed_count = (int)v["embeds"].size();
     for (const auto &e : v["embeds"].items()) {

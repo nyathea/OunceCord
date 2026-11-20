@@ -28,6 +28,7 @@ Color on_accent = Color::hex(0xffffff);  // text on accent/danger fills
 Color overlay;                           // a faint wash over rows: lighter on dark themes, darker on light
 Color mention_fg, mention_bg;
 Color scrim;                             // behind full-screen panels
+Color bg_card;                           // floating panels (settings, emoji picker...)
 Color syntax[discord::syntax::kKindCount];  // code block colours, by syntax::Kind
 
 void applyTheme(Theme t)
@@ -37,6 +38,7 @@ void applyTheme(Theme t)
     bg_channels = Color::hex(0x26282d);
     bg_messages = Color::hex(0x303238);
     bg_panel = Color::hex(0x202226);
+    bg_card = Color::hex(0x26282d);
     bg_input = Color::hex(0x3a3d44);
     selected = Color::hex(0x41444b);
     hover = Color::hex(0x373a40);
@@ -69,6 +71,7 @@ void applyTheme(Theme t)
         bg_channels = Color::hex(0xf2f3f5);
         bg_messages = Color::hex(0xffffff);
         bg_panel = Color::hex(0xebedef);
+        bg_card = Color::hex(0xf2f3f5);
         bg_input = Color::hex(0xebedef);
         selected = Color::hex(0xd4d7dc);
         hover = Color::hex(0xe3e5e8);
@@ -90,6 +93,8 @@ void applyTheme(Theme t)
         bg_channels = Color::hex(0x000000);
         bg_messages = Color::hex(0x000000);
         bg_panel = Color::hex(0x0b0b0c);
+        // Dark gray, so panels stand out from the black behind them.
+        bg_card = Color::hex(0x121214);
         bg_input = Color::hex(0x1a1b1e);
         selected = Color::hex(0x26272b);
         hover = Color::hex(0x17181a);
@@ -119,6 +124,7 @@ constexpr float kUserPanelH = 56;
 
 constexpr float kTextSize = 17;
 constexpr float kSmallSize = 14;
+constexpr float kThreadBoxH = 46;
 // Emote-only messages: emotes are drawn 48 px tall, like Discord's jumbo emoji.
 constexpr float kJumboTextSize = 48 / Renderer::kInlineSize;
 
@@ -912,7 +918,7 @@ void App::drawEmojiPicker()
 {
     Rect c = emojiCardRect();
     m_r.fillRoundRect({c.x - 1, c.y - 1, c.w + 2, c.h + 2}, 11, col::bg_guilds);
-    m_r.fillRoundRect(c, 10, col::bg_channels);
+    m_r.fillRoundRect(c, 10, col::bg_card);
     // Top: title and the search.
     {
         Renderer::Bold b(m_r);
@@ -1008,6 +1014,8 @@ std::vector<App::Part> App::messageParts(size_t li) const
         parts.push_back({PartKind::Reply});
     for (size_t i = 0; i < L.images.size(); i++)
         parts.push_back({PartKind::Image, i});
+    if (L.thread_id)
+        parts.push_back({PartKind::Thread});
     if (L.id)
         for (size_t i = 0; i < L.chips.size(); i++)
             parts.push_back({PartKind::Reaction, i});
@@ -1064,6 +1072,7 @@ void App::activatePart()
                 openViewer((size_t)sel, m_selPart.index);
         }
         break;
+    case PartKind::Thread: openThread(L.thread_id, m_openChannel, L.thread_name); break;
     case PartKind::Reaction: toggleReaction((size_t)sel, m_selPart.index); break;
     case PartKind::None: break;
     }
@@ -1326,8 +1335,8 @@ void App::drawProfile()
         if (!m_profile.webhook) {
             gap();
             heading("MEMBER SINCE");
-            std::string since = discord::snowflakeDate(m_profile.id);
-            std::string joined = p ? discord::formatIsoDate(p->joined_server) : std::string();
+            std::string since = discord::snowflakeDate(m_profile.id, m_settings.date_format);
+            std::string joined = p ? discord::formatIsoDate(p->joined_server, m_settings.date_format) : std::string();
             if (draw) {
                 float w = m_r.drawText(px, y, "Discord  ", 14, col::muted);
                 w += m_r.drawText(px + w, y, since, 14, col::text);
@@ -1919,8 +1928,7 @@ void App::openChannel(Snowflake id)
     // A forum post keeps its forum open behind it.
     Channel *parent = c->isThread() ? m_client.findChannel(c->parent_id) : nullptr;
     m_openForum = parent && parent->isForum() ? parent->id : 0;
-    if (!c->isThread())
-        m_threadReturn = 0;
+    m_threadReturn = 0;
     m_openChannel = id;
     m_msgScroll = 0;
     m_msgScroller.stop();
@@ -1931,6 +1939,247 @@ void App::openChannel(Snowflake id)
     m_client.loadMessages(id);
     m_client.focusChannel(id);
 }
+
+// --- Forums and threads -------------------------------------------------------
+
+namespace {
+constexpr float kPostH = 108, kPostGap = 8, kPostThumb = 76;
+}
+
+void App::openForum(Snowflake id)
+{
+    Channel *c = m_client.findChannel(id);
+    if (!c || !c->isForum())
+        return;
+    if (m_openForum != id) {
+        m_forumIndex = 0;
+        m_forumScroll = 0;
+        m_forumScroller.stop();
+    }
+    m_openForum = id;
+    m_openChannel = 0;
+    m_threadReturn = 0;
+    m_selActive = false;
+    m_selPart = {};
+    m_composeFocus = false;
+    m_forumScrollPending = true;
+    m_client.loadForum(id);
+    m_client.focusChannel(id);
+}
+
+void App::openThread(Snowflake thread_id, Snowflake parent_id, const std::string &name)
+{
+    Snowflake from = m_openChannel;
+    Channel *parent = m_client.findChannel(parent_id);
+    m_client.ensureThread(thread_id, parent_id, parent ? parent->guild_id : 0, name);
+    openChannel(thread_id);
+    if (m_openChannel == thread_id && from && from != thread_id && !m_openForum)
+        m_threadReturn = from;
+    m_pane = Pane::Messages;
+}
+
+void App::buildForumPosts()
+{
+    m_forumPosts.clear();
+    Channel *forum = m_client.findChannel(m_openForum);
+    Guild *g = forum ? m_client.findGuild(forum->guild_id) : nullptr;
+    if (!g)
+        return;
+    std::vector<const Channel *> posts;
+    for (const auto &c : g->channels)
+        if (c.isThread() && c.parent_id == m_openForum)
+            posts.push_back(&c);
+    // Pinned first, then the latest activity, like Discord.
+    std::sort(posts.begin(), posts.end(), [](const Channel *a, const Channel *b) {
+        if (a->pinned() != b->pinned())
+            return a->pinned();
+        return std::max(a->last_message_id, a->id) > std::max(b->last_message_id, b->id);
+    });
+    for (const Channel *c : posts)
+        m_forumPosts.push_back(c->id);
+    m_forumIndex = std::clamp(m_forumIndex, 0, std::max(0, (int)m_forumPosts.size() - 1));
+}
+
+void App::drawForum(Rect area)
+{
+    m_forumHits.clear();
+    m_r.fillRect(area, col::bg_messages);
+    m_r.fillRect({area.x, area.y + kHeaderH - 1, area.w, 1}, col::bg_guilds);
+    Channel *forum = m_client.findChannel(m_openForum);
+    if (!forum) {
+        m_openForum = 0;
+        return;
+    }
+    Guild *g = m_client.findGuild(forum->guild_id);
+    discord::ForumPosts &fp = m_client.forum(m_openForum);
+    buildForumPosts();
+
+    // Header: the forum's name and its guidelines.
+    drawIcon("forum", {area.x + 18, area.y + 13, 22, 22}, col::muted);
+    float tw;
+    {
+        Renderer::Bold b(m_r);
+        tw = m_r.drawText(area.x + 46, area.y + 14, m_r.ellipsize(forum->name, 17, area.w / 2), 17, col::bright);
+    }
+    if (!forum->topic.empty()) {
+        std::string topic = discord::emotesAsText(
+            discord::resolveMentions(discord::md::plainText(forum->topic), mentionLookup(nullptr), false).text);
+        for (auto &c : topic)
+            if (c == '\n')
+                c = ' ';
+        m_r.fillRect({area.x + 58 + tw, area.y + 14, 1, 22}, col::bg_input);
+        m_r.drawText(area.x + 70 + tw, area.y + 17, m_r.ellipsize(topic, kSmallSize, area.w - tw - 90), kSmallSize,
+                     col::muted);
+    }
+
+    Rect view{area.x, area.y + kHeaderH, area.w, area.h - kHeaderH};
+    const float stride = kPostH + kPostGap;
+    m_forumContentH = 16 + m_forumPosts.size() * stride + (fp.has_more || fp.loading ? 40 : 0);
+    float max_scroll = std::max(0.0f, m_forumContentH - view.h);
+    if (m_forumScrollPending && !m_forumPosts.empty()) {
+        m_forumScrollPending = false;
+        float top = 12 + m_forumIndex * stride, bottom = top + kPostH;
+        if (top - 12 < m_forumScroll)
+            m_forumScroll = top - 12;
+        if (bottom + 12 > m_forumScroll + view.h)
+            m_forumScroll = bottom + 12 - view.h;
+        m_forumScroll = std::clamp(m_forumScroll, 0.0f, max_scroll);
+        m_forumScroller.stop();
+    }
+    m_forumScroller.update(m_forumScroll, 0, max_scroll, view.h, m_frameDt);
+    if (fp.loaded && fp.has_more && m_forumScroll >= max_scroll - 400)
+        m_client.loadMoreForum(m_openForum);
+
+    if (m_forumPosts.empty()) {
+        std::string msg = !fp.error.empty() ? fp.error : fp.loading || !fp.loaded ? "Loading posts..." : "No posts yet.";
+        m_r.drawText(view.x + view.w / 2 - m_r.measureText(msg, 16) / 2, view.y + 60, msg, 16,
+                     fp.error.empty() ? col::muted : col::danger);
+        return;
+    }
+
+    auto lookup = mentionLookup(nullptr);
+    m_r.pushClip(view);
+    for (size_t i = 0; i < m_forumPosts.size(); i++) {
+        Rect card{view.x + 16, view.y + 12 + i * stride - m_forumScroll, view.w - 32, kPostH};
+        if (card.y + card.h < view.y || card.y > view.y + view.h)
+            continue;
+        Channel *post = m_client.findChannel(m_forumPosts[i]);
+        if (!post)
+            continue;
+        bool focus = !m_mouseMode && m_pane == Pane::Messages && (int)i == m_forumIndex;
+        bool hover = hovering(card);
+        m_r.fillRoundRect(card, 8, focus || hover ? col::selected : col::bg_panel);
+        if (focus)
+            drawFocusRing(card);
+        float top = std::max(card.y, view.y), bottom = std::min(card.y + card.h, view.y + view.h);
+        m_forumHits.push_back({{card.x, top, card.w, bottom - top}, i});
+
+        auto first = fp.first.find(post->id);
+        const Message *fm = first != fp.first.end() ? &first->second : nullptr;
+        // A picture from the first message, on the right.
+        float text_right = card.x + card.w - 16;
+        if (fm)
+            for (const auto &a : fm->attachments)
+                if (a.isImage() || a.isVideo()) {
+                    Rect t{card.x + card.w - 12 - kPostThumb, card.y + (kPostH - kPostThumb) / 2, kPostThumb, kPostThumb};
+                    float s = m_r.scale();
+                    std::string url = discord::cdn::sizedImageUrl(discord::cdn::attachmentImageUrl(a),
+                                                                  (int)(kPostThumb * s), (int)(kPostThumb * s));
+                    if (a.spoiler)
+                        m_r.fillRoundRect(t, 6, col::bg_input);
+                    else if (GLuint tex = m_images.get(url))
+                        m_r.drawImage(tex, t, Shape::Rounded);
+                    else
+                        m_r.fillRoundRect(t, 6, col::bg_input);
+                    text_right = t.x - 12;
+                    break;
+                }
+        float x = card.x + 16, tw_max = text_right - x;
+        // Title, with pinned/locked marks.
+        float title_x = x;
+        if (post->locked) {
+            drawIcon("lock", {title_x, card.y + 15, 16, 16}, col::muted);
+            title_x += 22;
+        }
+        {
+            Renderer::Bold b(m_r);
+            float w = m_r.drawText(title_x, card.y + 12, m_r.ellipsize(post->name, 17, tw_max - (title_x - x) - 70), 17,
+                                   col::bright);
+            if (post->pinned()) {
+                Rect pin{title_x + w + 10, card.y + 13, m_r.measureText("Pinned", 12) + 14, 20};
+                m_r.fillRoundRect(pin, 10, col::accent);
+                m_r.drawText(pin.x + 7, pin.y + 3, "Pinned", 12, col::on_accent);
+            }
+        }
+        // Tags.
+        float ty = card.y + 38, tx = x;
+        for (Snowflake tid : post->applied_tags) {
+            const ForumTag *tag = nullptr;
+            for (const auto &t : forum->available_tags)
+                if (t.id == tid)
+                    tag = &t;
+            if (!tag)
+                continue;
+            std::string image;
+            if (tag->emoji_id || !tag->emoji.empty()) {
+                discord::Emote em;
+                em.id = tag->emoji_id;
+                em.name = tag->emoji;
+                if (!tag->emoji_id)
+                    em.unicode = tag->emoji;
+                image = discord::emotePath(em, 32);
+            }
+            float w = m_r.measureText(tag->name, 12) + 16 + (image.empty() ? 0 : 18);
+            if (tx + w > text_right)
+                break;
+            Rect chip{tx, ty, w, 20};
+            m_r.fillRoundRect(chip, 10, col::bg_input);
+            float lx = chip.x + 8;
+            if (!image.empty()) {
+                if (GLuint tex = m_images.get(image))
+                    m_r.drawImage(tex, {lx, chip.y + 3, 14, 14}, Shape::Rect);
+                lx += 18;
+            }
+            m_r.drawText(lx, chip.y + 3, tag->name, 12, col::text);
+            tx += w + 6;
+        }
+        // The first message: "Author: text".
+        float py = post->applied_tags.empty() ? card.y + 40 : card.y + 62;
+        if (fm) {
+            std::string author = g && !fm->webhook ? g->nameFor(fm->author) : fm->author.displayName();
+            std::string text = discord::emotesAsText(
+                discord::resolveMentions(discord::md::plainText(fm->content), mentionLookup(fm), false).text);
+            for (auto &c : text)
+                if (c == '\n')
+                    c = ' ';
+            if (text.empty() && !fm->attachments.empty())
+                text = fm->attachments[0].filename;
+            float aw;
+            {
+                Renderer::Bold b(m_r);
+                aw = m_r.drawText(x, py, m_r.ellipsize(author + ": ", 14, tw_max / 2), 14, col::text);
+            }
+            m_r.drawText(x + aw, py, m_r.ellipsize(text, 14, tw_max - aw), 14, col::muted);
+        } else if (post->applied_tags.empty()) {
+            m_r.drawText(x, py, "Open the post to read it.", 14, col::faint);
+        }
+        // Footer: replies and the latest activity.
+        float fy = card.y + kPostH - 26;
+        drawIcon("thread", {x, fy + 1, 16, 16}, col::muted);
+        int replies = std::max(0, post->message_count);
+        std::string info = std::to_string(replies) + (replies == 1 ? " message" : " messages");
+        Snowflake last = std::max(post->last_message_id, post->id);
+        info += "   " + lookup.time((int64_t)(snowflakeUnixMs(last) / 1000), 'R');
+        if (post->archived)
+            info += "   Archived";
+        m_r.drawText(x + 22, fy, m_r.ellipsize(info, 13, tw_max - 22), 13, col::muted);
+    }
+    if (fp.loading)
+        m_r.drawText(view.x + 18, view.y + 12 + m_forumPosts.size() * stride - m_forumScroll + 6, "Loading more posts...",
+                     kSmallSize, col::faint);
+    m_r.popClip();
+}
+
 
 // --- Input -----------------------------------------------------------------
 
@@ -1964,6 +2213,9 @@ void App::moveSelection(int delta)
             i = j;
         }
         m_channelIndex = i;
+    } else if (inForum()) {
+        m_forumIndex = std::clamp(m_forumIndex + delta, 0, std::max(0, (int)m_forumPosts.size() - 1));
+        m_forumScrollPending = true;
     } else if (m_composeFocus) {
         // Up from the text box row goes back to the newest message.
         if (delta < 0)
@@ -1994,6 +2246,9 @@ void App::activate()
                 m_pane = Pane::Messages;
             }
         }
+    } else if (inForum()) {
+        if ((size_t)m_forumIndex < m_forumPosts.size())
+            openChannel(m_forumPosts[m_forumIndex]);
     } else if (m_composeFocus) {
         auto items = composeItems();
         if (std::find(items.begin(), items.end(), m_composeSel) != items.end())
@@ -2033,6 +2288,16 @@ void App::back()
     m_composeFocus = false;
     m_selPart = {};
     m_gearFocus = false;
+    if (m_pane == Pane::Messages && m_openChannel && (m_openForum || m_threadReturn)) {
+        // From a thread back to its forum's posts or the channel it was opened from.
+        Snowflake forum = m_openForum, ret = m_threadReturn;
+        m_selActive = false;
+        if (forum)
+            openForum(forum);
+        else
+            openChannel(ret);
+        return;
+    }
     if (m_pane == Pane::Messages)
         m_pane = Pane::Channels;
     else if (m_pane == Pane::Channels)
@@ -2109,9 +2374,14 @@ void App::tapAt(float x, float y)
         return;
     }
     if (m_settingsOpen) {
+        if (m_settingsPage != SettingPage::Main && settingsBackRect().contains(x, y)) {
+            settingsBack();
+            return;
+        }
         auto items = settingItems();
+        Rect list = settingsListRect();
         for (size_t i = 0; i < items.size(); i++)
-            if (items[i].rect.contains(x, y)) {
+            if (items[i].rect.contains(x, y) && list.contains(x, y)) {
                 m_settingsIndex = (int)i;
                 changeSetting(items[i].row, 0);
                 return;
@@ -2188,8 +2458,14 @@ void App::tapAt(float x, float y)
                 openProfile(ah.second);
                 return;
             }
+        for (const auto &th : m_threadHits)
+            if (th.first.contains(x, y) && th.second < m_layout.size()) {
+                const MessageLayout &L = m_layout[th.second];
+                openThread(L.thread_id, m_openChannel, L.thread_name);
+                return;
+            }
     }
-    if (m_screen == Screen::Main) {
+    if (m_screen == Screen::Main && m_openChannel) {
         for (const ImageHit &h : m_imageHits) {
             if (!h.rect.contains(x, y))
                 continue;
@@ -2241,6 +2517,14 @@ void App::tapAt(float x, float y)
             m_msgScroll = 0;
             m_msgScroller.stop();
         }
+        else if (inForum()) {
+            for (const auto &h : m_forumHits)
+                if (h.first.contains(x, y) && h.second < m_forumPosts.size()) {
+                    m_forumIndex = (int)h.second;
+                    openChannel(m_forumPosts[h.second]);
+                    break;
+                }
+        }
         else if (m_openChannel && sendButtonRect().contains(x, y))
             sendDraft();
         else if (m_openChannel && emojiButtonRect().contains(x, y))
@@ -2267,12 +2551,16 @@ void App::tapAt(float x, float y)
 
 App::ScrollTarget App::scrollTarget(float start_x)
 {
+    if (m_settingsOpen)
+        return {&m_settingsScroller, &m_settingsScroll, -1};
     if (m_emojiOpen)
         return {&m_emojiScroller, &m_emojiScroll, -1};
     if (m_profileOpen)
         return {&m_profileScroller, &m_profileScroll, -1};
     if (m_pickerOpen)
         return {&m_pickerScroller, &m_pickerScroll, -1};
+    if (start_x >= kGuildBarW + kChannelW && inForum())
+        return {&m_forumScroller, &m_forumScroll, -1};
     if (start_x >= kGuildBarW + kChannelW)
         return {&m_msgScroller, &m_msgScroll, 1};  // distance from the bottom
     if (start_x >= kGuildBarW)
@@ -2600,7 +2888,7 @@ void App::handleInput()
     if (down & right) {
         if (m_pane == Pane::Guilds)
             activate();
-        else if (m_pane == Pane::Channels && m_openChannel && !m_gearFocus)
+        else if (m_pane == Pane::Channels && (m_openChannel || inForum()) && !m_gearFocus)
             m_pane = Pane::Messages;
         else if (m_pane == Pane::Messages && m_composeFocus)
             stepCompose(1);
@@ -2713,7 +3001,7 @@ void App::drawLogin()
     const float W = Renderer::kWidth, H = Renderer::kHeight;
     m_r.fillRect({0, 0, W, H}, col::bg_guilds);
     Rect card = loginCard(m_settings.qr_login);
-    m_r.fillRoundRect(card, 10, col::bg_channels);
+    m_r.fillRoundRect(card, 10, col::bg_card);
 
     const float formCx = card.x + 48 + kLoginFormW / 2;
     float y = card.y + 30;
@@ -2882,7 +3170,7 @@ void App::drawMain()
         // Connecting overlay.
         Rect box{W / 2 - 220, H / 2 - 60, 440, 120};
         m_r.fillRect({0, 0, W, H}, Color(0, 0, 0, 140));
-        m_r.fillRoundRect(box, 10, col::bg_channels);
+        m_r.fillRoundRect(box, 10, col::bg_card);
         const char *msg = m_client.status() == discord::GatewayStatus::Fatal ? "Connection failed"
                                                                                : "Connecting to Discord...";
         m_r.drawText(W / 2 - m_r.measureText(msg, 20) / 2, box.y + 30, msg, 20, col::bright);
@@ -3047,7 +3335,7 @@ void App::drawChannelList(Rect area)
             continue;
         }
         bool is_sel = (int)i == m_channelIndex;
-        bool is_open = row.id == m_openChannel;
+        bool is_open = row.id == m_openChannel || (m_openForum && row.id == m_openForum);
         Rect r{list.x + 8, y + 1, list.w - 16, kRowH - 2};
         bool is_hover = m_mouseMode && hitChannelRow(m_mouseX, m_mouseY) == (int)i;
         // In mouse mode the hover replaces the controller focus highlight.
@@ -3065,8 +3353,9 @@ void App::drawChannelList(Rect area)
             drawAvatar(r.x + 16, r.y + r.h / 2, 12, row.label, row.id, row.icon);
             x = r.x + 36;
         } else if (row.kind) {
-            drawIcon(row.kind, {r.x + 8, r.y + r.h / 2 - 10, 20, 20}, row.voice ? col::faint : col::muted);
-            x = r.x + 34;
+            float ix = r.x + 8 + row.indent * 18;
+            drawIcon(row.kind, {ix, r.y + r.h / 2 - 10, 20, 20}, row.voice ? col::faint : col::muted);
+            x = ix + 26;
         }
         Renderer::Bold b(m_r, is_open || (is_sel && m_pane == Pane::Channels && !m_mouseMode));
         m_r.drawText(x, r.y + 7, m_r.ellipsize(row.label, 16, r.x + r.w - x - 8), 16, tc);
@@ -3122,6 +3411,13 @@ Rect App::settingsCardRect() const
     return {Renderer::kWidth / 2 - kSettingsW / 2, 36, kSettingsW, Renderer::kHeight - 72};
 }
 
+Rect App::settingsListRect() const
+{
+    Rect c = settingsCardRect();
+    float top = c.y + 72, bottom = c.y + c.h - 12;
+    return {c.x, top, c.w, bottom - top};
+}
+
 Rect App::settingsGearRect() const
 {
     return {kGuildBarW + kChannelW - 44, Renderer::kHeight - kUserPanelH + 12, 32, 32};
@@ -3129,35 +3425,82 @@ Rect App::settingsGearRect() const
 
 std::vector<App::SettingItem> App::settingItems() const
 {
-    Rect c = settingsCardRect();
-    float x = c.x + 28, w = c.w - 56, y = c.y + 76;
+    Rect c = settingsCardRect(), list = settingsListRect();
+    float x = c.x + 28, w = c.w - 56, y = list.y + 4 - m_settingsScroll;
     std::vector<SettingItem> out;
-    auto section = [&] { y += kSettingsHeadH; };
-    auto row = [&](SettingRow r, float h = kSettingsRowH) {
-        out.push_back({r, {x, y, w, h}});
-        y += h + 4;
+    auto row = [&](SettingRow r, float h = kSettingsRowH, int info = 0) {
+        out.push_back({r, {x, y, w, h}, info});
+        y += h + 6;
     };
-    section();  // Appearance
-    row(SettingRow::Theme);
-    y += 10;
-    section();  // Input
-    row(SettingRow::Mouse);
-    row(SettingRow::Touch);
-    y += 10;
-    section();  // Experimental
-    row(SettingRow::QrLogin, 72);
-    row(SettingRow::Videos, 72);
-    // Log out sits at the bottom of the card.
-    out.push_back({SettingRow::LogOut, {x, c.y + c.h - 28 - 48, w, 48}});
+    switch (m_settingsPage) {
+    case SettingPage::Main:
+        row(SettingRow::PageAppearance, 60);
+        row(SettingRow::PageTime, 60);
+        row(SettingRow::PageInput, 60);
+        row(SettingRow::PageExperimental, 60);
+        row(SettingRow::PageAbout, 60);
+        y += 12;
+        row(SettingRow::LogOut, 52);
+        break;
+    case SettingPage::Appearance: row(SettingRow::Theme); break;
+    case SettingPage::Time:
+        row(SettingRow::Clock, 60);
+        row(SettingRow::Date, 60);
+        break;
+    case SettingPage::Input:
+        row(SettingRow::Mouse, 60);
+        row(SettingRow::Touch);
+        break;
+    case SettingPage::Experimental:
+        row(SettingRow::QrLogin, 72);
+        row(SettingRow::Videos, 72);
+        break;
+    case SettingPage::About:
+        for (int i = 0; i < 4; i++)
+            row(SettingRow::Info, 48, i);
+        break;
+    }
     return out;
 }
 
 void App::openSettings()
 {
     m_settingsOpen = true;
+    m_settingsPage = SettingPage::Main;
     m_settingsIndex = 0;
+    m_settingsScroll = 0;
+    m_settingsScroller.stop();
     m_logoutArmedUntil = 0;
     m_composeMenuOpen = false;
+}
+
+void App::openSettingsPage(SettingPage page)
+{
+    m_settingsPage = page;
+    m_settingsIndex = 0;
+    m_settingsScroll = 0;
+    m_settingsScroller.stop();
+    m_logoutArmedUntil = 0;
+}
+
+void App::settingsBack()
+{
+    if (m_settingsPage == SettingPage::Main) {
+        m_settingsOpen = false;
+        return;
+    }
+    // Back to the main list, on the page we came from.
+    SettingRow from = m_settingsPage == SettingPage::Appearance   ? SettingRow::PageAppearance
+                      : m_settingsPage == SettingPage::Time         ? SettingRow::PageTime
+                      : m_settingsPage == SettingPage::Input        ? SettingRow::PageInput
+                      : m_settingsPage == SettingPage::Experimental ? SettingRow::PageExperimental
+                                                                    : SettingRow::PageAbout;
+    openSettingsPage(SettingPage::Main);
+    auto items = settingItems();
+    for (size_t i = 0; i < items.size(); i++)
+        if (items[i].row == from)
+            m_settingsIndex = (int)i;
+    m_settingsScrollPending = true;
 }
 
 void App::applySettings()
@@ -3181,27 +3524,34 @@ void App::applySettings()
 
 void App::changeSetting(SettingRow row, int dir)
 {
+    // Left/right (dir) only steps through choices (theme, date format);
+    // switches and pages take A or a tap.
+    bool picker = row == SettingRow::Theme || row == SettingRow::Date;
+    if (dir && !picker)
+        return;
     switch (row) {
+    case SettingRow::PageAppearance: openSettingsPage(SettingPage::Appearance); return;
+    case SettingRow::PageTime: openSettingsPage(SettingPage::Time); return;
+    case SettingRow::PageInput: openSettingsPage(SettingPage::Input); return;
+    case SettingRow::PageExperimental: openSettingsPage(SettingPage::Experimental); return;
+    case SettingRow::PageAbout: openSettingsPage(SettingPage::About); return;
+    case SettingRow::Info: return;
     case SettingRow::Theme: {
         int t = (int)m_settings.theme + (dir ? dir : 1);
         m_settings.theme = (Theme)((t % 3 + 3) % 3);
         break;
     }
-    case SettingRow::Mouse:
-        m_settings.mouse = dir ? dir > 0 : !m_settings.mouse;
+    case SettingRow::Clock: m_settings.clock24 = !m_settings.clock24; break;
+    case SettingRow::Date: {
+        int f = (int)m_settings.date_format + (dir ? dir : 1);
+        m_settings.date_format = (DateFormat)((f % 3 + 3) % 3);
         break;
-    case SettingRow::Touch:
-        m_settings.touch = dir ? dir > 0 : !m_settings.touch;
-        break;
-    case SettingRow::QrLogin:
-        m_settings.qr_login = dir ? dir > 0 : !m_settings.qr_login;
-        break;
-    case SettingRow::Videos:
-        m_settings.videos = dir ? dir > 0 : !m_settings.videos;
-        break;
+    }
+    case SettingRow::Mouse: m_settings.mouse = !m_settings.mouse; break;
+    case SettingRow::Touch: m_settings.touch = !m_settings.touch; break;
+    case SettingRow::QrLogin: m_settings.qr_login = !m_settings.qr_login; break;
+    case SettingRow::Videos: m_settings.videos = !m_settings.videos; break;
     case SettingRow::LogOut:
-        if (dir)
-            return;
         if (m_frameTime < m_logoutArmedUntil) {
             // Ends the session on Discord's side too, so the token is useless.
             m_settingsOpen = false;
@@ -3218,16 +3568,26 @@ void App::changeSetting(SettingRow row, int dir)
 
 void App::handleSettingsInput(u64 down)
 {
-    auto items = settingItems();
-    if (down & (HidNpadButton_B | HidNpadButton_Minus)) {
+    if (down & HidNpadButton_Minus) {
         m_settingsOpen = false;
         return;
     }
+    if (down & HidNpadButton_B) {
+        settingsBack();
+        return;
+    }
+    auto items = settingItems();
     int n = (int)items.size();
-    if (down & HidNpadButton_AnyUp)
+    if (n == 0)
+        return;
+    if (down & HidNpadButton_AnyUp) {
         m_settingsIndex = (m_settingsIndex + n - 1) % n;
-    if (down & HidNpadButton_AnyDown)
+        m_settingsScrollPending = true;
+    }
+    if (down & HidNpadButton_AnyDown) {
         m_settingsIndex = (m_settingsIndex + 1) % n;
+        m_settingsScrollPending = true;
+    }
     m_settingsIndex = std::clamp(m_settingsIndex, 0, n - 1);
     SettingRow r = items[m_settingsIndex].row;
     if (r != SettingRow::LogOut)
@@ -3240,48 +3600,145 @@ void App::handleSettingsInput(u64 down)
         changeSetting(r, 1);
 }
 
+Rect App::settingsBackRect() const
+{
+    Rect c = settingsCardRect();
+    return {c.x + 16, c.y + 18, 40, 40};
+}
+
 void App::drawSettings()
 {
     const float W = Renderer::kWidth, H = Renderer::kHeight;
     m_r.fillRect({0, 0, W, H}, Color(0, 0, 0, 150));
     Rect c = settingsCardRect();
-    m_r.fillRoundRect(c, 12, col::bg_channels);
+    m_r.fillRoundRect(c, 12, col::bg_card);
+
+    // Header: the page title, with a back arrow on sub-pages.
+    const char *title = "Settings";
+    switch (m_settingsPage) {
+    case SettingPage::Main: break;
+    case SettingPage::Appearance: title = "Appearance"; break;
+    case SettingPage::Time: title = "Date & time"; break;
+    case SettingPage::Input: title = "Input"; break;
+    case SettingPage::Experimental: title = "Experimental"; break;
+    case SettingPage::About: title = "About"; break;
+    }
+    float title_x = c.x + 28;
+    if (m_settingsPage != SettingPage::Main) {
+        Rect b = settingsBackRect();
+        if (hovering(b))
+            m_r.fillRoundRect(b, 8, col::hover);
+        drawIcon("arrow/back", {b.x + 8, b.y + 8, 24, 24}, col::text);
+        title_x = b.x + b.w + 8;
+    }
     {
         Renderer::Bold b(m_r);
-        m_r.drawText(c.x + 28, c.y + 24, "Settings", 24, col::bright);
+        m_r.drawText(title_x, c.y + 24, title, 24, col::bright);
     }
-    const char *close = m_mouseMode ? "Click outside to close" : "(B) Close";
+    const char *close = m_mouseMode ? "Click outside to close"
+                        : m_settingsPage == SettingPage::Main ? "(B) Close" : "(B) Back   (-) Close";
     m_r.drawText(c.x + c.w - 28 - m_r.measureText(close, 13), c.y + 32, close, 13, col::faint);
 
+    Rect list = settingsListRect();
     auto items = settingItems();
+    if (items.empty())
+        return;
     m_settingsIndex = std::clamp(m_settingsIndex, 0, (int)items.size() - 1);
-    auto header = [&](const char *t, float y) {
-        Renderer::Bold b(m_r);
-        m_r.drawText(c.x + 28, y + 10, t, 12, col::muted);
-    };
-    header("APPEARANCE", items[0].rect.y - kSettingsHeadH);
-    header("INPUT", items[1].rect.y - kSettingsHeadH);
-    header("EXPERIMENTAL", items[3].rect.y - kSettingsHeadH);
+    {
+        const Rect &last = items.back().rect;
+        m_settingsContentH = last.y + last.h + m_settingsScroll - list.y + 12;
+    }
+    float max_scroll = std::max(0.0f, m_settingsContentH - list.h);
+    if (m_settingsScrollPending) {
+        m_settingsScrollPending = false;
+        const Rect &f = items[m_settingsIndex].rect;
+        float top = f.y + m_settingsScroll - list.y - 4, bottom = top + f.h + 12;
+        if (top < m_settingsScroll)
+            m_settingsScroll = top;
+        if (bottom > m_settingsScroll + list.h)
+            m_settingsScroll = bottom - list.h;
+        m_settingsScroll = std::clamp(m_settingsScroll, 0.0f, max_scroll);
+        m_settingsScroller.stop();
+    }
+    m_settingsScroller.update(m_settingsScroll, 0, max_scroll, list.h, m_frameDt);
+    items = settingItems();  // at the new scroll
 
+    const SystemInfo &si = SystemInfo::get();
+    m_r.pushClip(list);
     for (size_t i = 0; i < items.size(); i++) {
         const SettingItem &it = items[i];
         Rect r = it.rect;
+        if (r.y + r.h < list.y || r.y > list.y + list.h)
+            continue;
         bool focus = m_mouseMode ? hovering(r) : (int)i == m_settingsIndex;
         if (it.row == SettingRow::LogOut) {
             bool armed = m_frameTime < m_logoutArmedUntil;
-            m_r.fillRoundRect(r, 8, armed || focus ? col::danger : col::bg_input);
+            bool on = armed || focus;
+            m_r.fillRoundRect(r, 8, on ? col::danger : col::bg_input);
             const char *t = armed ? (m_mouseMode ? "Click again to log out" : "Press (A) again to log out") : "Log out";
-            m_r.drawText(r.x + r.w / 2 - m_r.measureText(t, 17) / 2, r.y + 13, t, 17,
-                         armed || focus ? col::on_accent : col::danger);
+            float tw = m_r.measureText(t, 17) + 30;
+            drawIcon("settings/logout", {r.x + r.w / 2 - tw / 2, r.y + r.h / 2 - 11, 22, 22},
+                     on ? col::on_accent : col::danger);
+            m_r.drawText(r.x + r.w / 2 - tw / 2 + 30, r.y + r.h / 2 - 11, t, 17, on ? col::on_accent : col::danger);
+            continue;
+        }
+        if (it.row == SettingRow::Info) {
+            // About: label and value, read only.
+            const std::pair<const char *, const std::string *> rows[] = {
+                {"HOS version", &si.hos}, {"Platform", &si.platform}, {"App version", &si.app}, {"Environment", &si.environment}};
+            const auto &p = rows[std::clamp(it.info, 0, 3)];
+            m_r.fillRoundRect(r, 8, focus && !m_mouseMode ? col::selected : col::bg_input);
+            m_r.drawText(r.x + 18, r.y + r.h / 2 - 10, p.first, 16, col::muted);
+            float vw = m_r.measureText(*p.second, 16);
+            m_r.drawText(r.x + r.w - 18 - vw, r.y + r.h / 2 - 10, *p.second, 16, col::text);
             continue;
         }
         m_r.fillRoundRect(r, 8, focus ? col::selected : col::bg_input);
         if (focus && !m_mouseMode)
             m_r.fillRoundRect({r.x, r.y + 8, 3, r.h - 16}, 1.5f, col::accent);
-        const char *label = "", *desc = nullptr;
-        bool toggle = true, on = false;
+
+        const char *label = "", *icon = nullptr;
+        std::string desc, value;
+        enum { Toggle, Picker, Page } kind = Toggle;
+        bool on = false;
         switch (it.row) {
-        case SettingRow::Theme: label = "Theme"; toggle = false; break;
+        case SettingRow::PageAppearance:
+            label = "Appearance", icon = "settings/appearance", kind = Page;
+            desc = "Theme and colours";
+            break;
+        case SettingRow::PageTime:
+            label = "Date & time", icon = "settings/time", kind = Page;
+            desc = "How times and dates are shown";
+            break;
+        case SettingRow::PageInput:
+            label = "Input", icon = "settings/input", kind = Page;
+            desc = "Joy-Con mouse and the touch screen";
+            break;
+        case SettingRow::PageExperimental:
+            label = "Experimental", icon = "settings/experimental", kind = Page;
+            desc = "Features that are still being tested";
+            break;
+        case SettingRow::PageAbout:
+            label = "About", icon = "settings/about", kind = Page;
+            desc = "Versions of the app and the system";
+            break;
+        case SettingRow::Theme:
+            label = "Theme", kind = Picker;
+            value = Settings::themeName(m_settings.theme);
+            break;
+        case SettingRow::Clock:
+            label = "24-hour time";
+            desc = m_settings.clock24 ? "Times show as 14:05." : "Times show as 2:05 PM.";
+            on = m_settings.clock24;
+            break;
+        case SettingRow::Date: {
+            label = "Date format", kind = Picker;
+            value = Settings::dateFormatName(m_settings.date_format);
+            LocalTime t{};
+            if (localTime(unixNow(), t))
+                desc = "Today is " + numericDate(t.year, t.month, t.day, m_settings.date_format) + ".";
+            break;
+        }
         case SettingRow::Mouse:
             label = "Mouse mode";
             desc = "Slide a Joy-Con 2 on a surface to use it as a mouse.";
@@ -3301,48 +3758,53 @@ void App::drawSettings()
             break;
         default: break;
         }
-        float ty = desc ? r.y + 8 : r.y + r.h / 2 - 11;
-        m_r.drawText(r.x + 18, ty, label, 17, col::text);
-        if (desc) {
+        float lx = r.x + 18;
+        if (icon) {
+            float cy = r.y + r.h / 2;
+            drawIcon(icon, {lx, cy - 12, 24, 24}, focus ? col::bright : col::text);
+            lx += 40;
+        }
+        float right_w = kind == Page ? 40 : kind == Toggle ? 80 : 30 + m_r.measureText(value, 16) + 30;
+        float ty = desc.empty() ? r.y + r.h / 2 - 11 : r.y + (kind == Page ? 10 : 8);
+        m_r.drawText(lx, ty, label, 17, col::text);
+        if (!desc.empty()) {
             float dy = ty + 24;
-            for (const auto &line : m_r.wrapText(desc, 12, r.w - 18 - 90)) {
-                m_r.drawText(r.x + 18, dy, line, 12, col::muted);
+            auto lines = kind == Page ? std::vector<std::string>{m_r.ellipsize(desc, 13, r.x + r.w - right_w - lx)}
+                                      : m_r.wrapText(desc, 12, r.x + r.w - right_w - lx);
+            for (const auto &line : lines) {
+                m_r.drawText(lx, dy, line, kind == Page ? 13 : 12, col::muted);
                 dy += 16;
             }
         }
-        if (toggle) {
-            // A switch.
-            Rect sw{r.x + r.w - 18 - 44, r.y + r.h / 2 - 12, 44, 24};
+        float rx = r.x + r.w - 18, mid = r.y + r.h / 2;
+        if (kind == Page) {
+            drawIcon("arrow/forward", {rx - 20, mid - 10, 20, 20}, focus ? col::text : col::faint);
+        } else if (kind == Toggle) {
+            Rect sw{rx - 44, mid - 12, 44, 24};
             m_r.fillRoundRect(sw, 12, on ? col::online : col::faint);
             m_r.fillCircle(on ? sw.x + sw.w - 12 : sw.x + 12, sw.y + 12, 9, Color::hex(0xffffff));
         } else {
             // < Dark >
-            std::string v = Settings::themeName(m_settings.theme);
-            float vw = m_r.measureText(v, 16);
-            float rx = r.x + r.w - 18;
+            float vw = m_r.measureText(value, 16);
             Color ac = focus ? col::text : col::faint;
-            m_r.fillTriangle(rx - 8, r.y + r.h / 2 - 6, rx, r.y + r.h / 2, rx - 8, r.y + r.h / 2 + 6, ac);
-            m_r.drawText(rx - 18 - vw, r.y + r.h / 2 - 10, v, 16, col::bright);
-            float lx = rx - 18 - vw - 14;
-            m_r.fillTriangle(lx, r.y + r.h / 2 - 6, lx - 8, r.y + r.h / 2, lx, r.y + r.h / 2 + 6, ac);
+            m_r.fillTriangle(rx - 8, mid - 6, rx, mid, rx - 8, mid + 6, ac);
+            m_r.drawText(rx - 18 - vw, mid - 10, value, 16, col::bright);
+            float ax = rx - 18 - vw - 14;
+            m_r.fillTriangle(ax, mid - 6, ax - 8, mid, ax, mid + 6, ac);
         }
     }
-    // About this console, in plain text under the settings.
-    {
-        const SystemInfo &si = SystemInfo::get();
-        const SettingItem &last = items[4];
-        float y = last.rect.y + last.rect.h + 12;
-        const std::pair<const char *, const std::string *> rows[] = {
-            {"HOS version", &si.hos}, {"Platform", &si.platform}, {"App version", &si.app}, {"Environment", &si.environment}};
-        float col_w = (c.w - 56) / 2;
-        for (int i = 0; i < 4; i++) {
-            float x = c.x + 28 + (i % 2) * col_w, ry = y + (i / 2) * 22;
-            float lw = m_r.drawText(x, ry, rows[i].first, 13, col::muted);
-            m_r.drawText(x + lw + 10, ry, m_r.ellipsize(*rows[i].second, 13, col_w - lw - 20), 13, col::text);
-        }
+    m_r.popClip();
+
+    std::string hints;
+    if (m_mouseMode) {
+        hints = "Click a setting to change it";
+    } else {
+        SettingRow fr = items[m_settingsIndex].row;
+        bool picker = fr == SettingRow::Theme || fr == SettingRow::Date;
+        hints = std::string("(Up/Down) Choose   ") +
+                (fr == SettingRow::Info ? "" : picker ? "(A / Left/Right) Change   " : "(A) Select   ") +
+                (m_settingsPage == SettingPage::Main ? "(B or -) Close" : "(B) Back   (-) Close");
     }
-    const char *hints = m_mouseMode ? "Click a setting to change it"
-                                    : "(Up/Down) Choose   (A) Change   (Left/Right) Pick theme   (B or -) Close";
     m_r.drawText(c.x + c.w / 2 - m_r.measureText(hints, 13) / 2, c.y + c.h + 10, hints, 13, Color::hex(0xdcdee3));
 }
 
@@ -3392,12 +3854,13 @@ discord::MentionLookup App::mentionLookup(const Message *m)
         name = c->isDm() ? c->label() : c->name;
         return true;
     };
-    lk.time = [](int64_t when, char style) {
+    lk.time = [this](int64_t when, char style) {
         LocalTime t{};
         if (!localTime(when, t))
             return std::to_string(when);
         return discord::formatTimestamp(when, unixNow(), style,
-                                        {t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday});
+                                        {t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday},
+                                        m_settings.clock24, m_settings.date_format);
     };
     return lk;
 }
@@ -3736,7 +4199,7 @@ void App::rebuildLayout(float width)
         uint32_t role_color = guild && !m.webhook ? guild->colorFor(m.author.id) : 0;
         L.author_color = role_color ? Color::hex(role_color) : col::bright;
         L.avatar = discord::cdn::avatarPath(m.author);
-        L.time = m.id ? formatTime(ms / 1000) : "";
+        L.time = m.id ? formatTime(ms / 1000, m_settings.clock24, m_settings.date_format) : "";
         L.text_color = m.failed ? col::danger : m.pending ? col::faint : col::text;
 
         std::string content = m.content;
@@ -3750,6 +4213,7 @@ void App::rebuildLayout(float width)
             case 3: content = L.author + " started a call."; break;
             case 4: content = L.author + " changed the channel name."; break;
             case 18: content = L.author + " started a thread: " + m.content; break;
+            case 21: content = "This thread was started from a message."; break;
             default: if (content.empty()) content = "(system message)"; break;
             }
             L.text_color = col::muted;
@@ -3842,6 +4306,17 @@ void App::rebuildLayout(float width)
                                 m.pending ? col::muted : col::danger});
         if (m.failed)
             L.extras.push_back({m.error.empty() ? "Failed to send." : "Failed to send: " + m.error, col::danger});
+        // A thread started from this message (not inside forum posts: there
+        // the opening message is the post itself).
+        if (m.thread_id && m.thread_id != m_openChannel) {
+            L.thread_id = m.thread_id;
+            L.thread_name = m.thread_name.empty() ? "Thread" : m.thread_name;
+            int n = m.thread_count;
+            if (Channel *t = m_client.findChannel(m.thread_id))
+                n = std::max(n, t->message_count);
+            L.thread_info = n > 0 ? std::to_string(n) + (n == 1 ? " message" : " messages") + "  ›  See thread"
+                                  : "See thread";
+        }
 
         L.can_reply = m.id && !m.pending && !m.failed && !system;
         {
@@ -3875,6 +4350,8 @@ void App::rebuildLayout(float width)
         if (!L.images.empty() && L.text_h > 0)
             h += 4;
         h += L.extras.size() * (kSmallSize * 1.5f);
+        if (L.thread_id)
+            h += kThreadBoxH + 6;
         if (!L.chips.empty())
             h += 4 + (L.chips.back().row + 1) * (kChipH + kChipGap);
         h += L.show_header ? 4 : 2;
@@ -3890,6 +4367,21 @@ void App::rebuildLayout(float width)
 
 void App::drawMessages(Rect area)
 {
+    // What can be tapped is collected while drawing: start empty, so the
+    // forum list (or no channel) never leaves the last chat's targets live.
+    m_imageHits.clear();
+    m_reactionHits.clear();
+    m_messageHits.clear();
+    m_avatarHits.clear();
+    m_spoilerHits.clear();
+    m_replyButtonLayout = -1;
+    m_threadHits.clear();
+    if (inForum()) {
+        m_forumHits.clear();
+        drawForum(area);
+        return;
+    }
+    m_forumHits.clear();
     m_r.fillRect(area, col::bg_messages);
     Channel *ch = m_openChannel ? m_client.findChannel(m_openChannel) : nullptr;
 
@@ -3903,8 +4395,18 @@ void App::drawMessages(Rect area)
     }
     std::string title = ch->label();
     float tx0 = area.x + 18;
+    Channel *thread_parent = ch->isThread() ? m_client.findChannel(ch->parent_id) : nullptr;
+    if (thread_parent) {
+        // "parent > thread", like Discord's header.
+        drawIcon(thread_parent->isForum() ? "forum" : "hash", {tx0, area.y + 13, 22, 22}, col::muted);
+        tx0 += 28;
+        float pw = m_r.drawText(tx0, area.y + 15, m_r.ellipsize(thread_parent->name, 16, area.w / 5), 16, col::muted);
+        tx0 += pw + 10;
+        drawIcon("chevron", {tx0, area.y + 18, 12, 12}, col::faint);
+        tx0 += 20;
+    }
     if (!ch->isDm()) {
-        drawIcon("hash", {tx0, area.y + 13, 22, 22}, col::muted);
+        drawIcon(ch->isThread() ? "thread" : "hash", {tx0, area.y + 13, 22, 22}, col::muted);
         tx0 += 28;
         title = ch->name;
     }
@@ -3913,7 +4415,7 @@ void App::drawMessages(Rect area)
         Renderer::Bold b(m_r);
         tw = m_r.drawText(tx0, area.y + 14, m_r.ellipsize(title, 17, area.w / 2), 17, col::bright) + (tx0 - area.x - 18);
     }
-    if (!ch->isDm())
+    if (!ch->isDm() && !ch->isThread())
         title = "#" + ch->name;  // for the placeholder and the welcome line
     if (!ch->topic.empty()) {
         std::string topic = discord::emotesAsText(discord::resolveMentions(discord::md::plainText(ch->topic), mentionLookup(nullptr), false).text);
@@ -3966,12 +4468,6 @@ void App::drawMessages(Rect area)
     }
     const float lh = m_r.lineHeight(kTextSize);
     const float tx = view.x + kMsgTextX;
-    m_imageHits.clear();
-    m_reactionHits.clear();
-    m_messageHits.clear();
-    m_avatarHits.clear();
-    m_spoilerHits.clear();
-    m_replyButtonLayout = -1;
     const bool can_reply_here = m_client.canSend(*ch);
     for (size_t li = 0; li < m_layout.size(); li++) {
         const MessageLayout &L = m_layout[li];
@@ -4126,6 +4622,23 @@ void App::drawMessages(Rect area)
         for (const auto &e : L.extras) {
             m_r.drawText(tx, cy + 2, e.first, kSmallSize, e.second);
             cy += kSmallSize * 1.5f;
+        }
+        if (L.thread_id) {
+            Rect r{tx, cy + 3, std::min(420.0f, view.x + view.w - 24 - tx), kThreadBoxH};
+            bool on = hovering(r) || partFocused(li, PartKind::Thread);
+            m_r.fillRoundRect(r, 6, on ? col::selected : col::bg_panel);
+            if (partFocused(li, PartKind::Thread))
+                drawFocusRing(r);
+            drawIcon("thread", {r.x + 12, r.y + r.h / 2 - 10, 20, 20}, col::muted);
+            {
+                Renderer::Bold b(m_r);
+                m_r.drawText(r.x + 42, r.y + 6, m_r.ellipsize(L.thread_name, 15, r.w - 54), 15, col::bright);
+            }
+            m_r.drawText(r.x + 42, r.y + 26, m_r.ellipsize(L.thread_info, 13, r.w - 54), 13, col::link);
+            float top = std::max(r.y, view.y), bottom = std::min(r.y + r.h, view.y + view.h);
+            if (bottom > top)
+                m_threadHits.push_back({{r.x, top, r.w, bottom - top}, li});
+            cy += kThreadBoxH + 6;
         }
         if (!L.chips.empty()) {
             cy += 4;
@@ -4676,6 +5189,10 @@ void App::drawHints(Rect area)
         break;
     case Pane::Messages:
     {
+        if (inForum()) {
+            hints = "(A) Open post   (Up/Down) Post   (B) Back   (L/R) Server";
+            break;
+        }
         int sel = selectedIndex();
         std::string a;
         if (m_composeFocus) {
@@ -4698,6 +5215,7 @@ void App::drawHints(Rect area)
                 a = m_selPart.index < m_layout[sel].images.size() && !m_layout[sel].images[m_selPart.index].video.empty()
                         ? "Play video" : "View image";
                 break;
+            case PartKind::Thread: a = "Open thread"; break;
             case PartKind::Reaction: a = "React"; break;
             case PartKind::None: break;
             }

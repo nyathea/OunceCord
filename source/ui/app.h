@@ -396,16 +396,31 @@ private:
     Settings m_settings;
     bool m_settingsOpen = false;
     int m_settingsIndex = 0;
-    enum class SettingRow { Theme, Mouse, Touch, QrLogin, Videos, LogOut };
+    // The main page lists the sections (each its own page) and Log out.
+    enum class SettingPage { Main, Appearance, Time, Input, Experimental, About };
+    enum class SettingRow {
+        PageAppearance, PageTime, PageInput, PageExperimental, PageAbout, LogOut,
+        Theme, Clock, Date, Mouse, Touch, QrLogin, Videos,
+        Info,  // a line of the About page
+    };
     struct SettingItem {
         SettingRow row;
         Rect rect;
+        int info = 0;  // Info: which line
     };
-    std::vector<SettingItem> settingItems() const;  // in screen space
+    SettingPage m_settingsPage = SettingPage::Main;
+    void openSettingsPage(SettingPage page);
+    void settingsBack();  // to the main page, or closes
+    Rect settingsBackRect() const;
+    std::vector<SettingItem> settingItems() const;  // in screen space (scrolled)
+    Rect settingsListRect() const;  // the scrolling part, under the title
+    float m_settingsScroll = 0, m_settingsContentH = 0;
+    bool m_settingsScrollPending = false;
+    Scroller m_settingsScroller;
     Rect settingsGearRect() const;
     Rect settingsCardRect() const;
     void openSettings();
-    void changeSetting(SettingRow row, int dir);  // dir: -1/+1 (left/right), 0 = A/tap
+    void changeSetting(SettingRow row, int dir);  // dir: -1/+1 (left/right, pickers only), 0 = A/tap
     void handleSettingsInput(u64 down);
     void drawSettings();
     void applySettings();  // theme etc. after a change

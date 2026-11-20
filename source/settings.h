@@ -6,6 +6,8 @@
 
 #include <string>
 
+#include "util/datefmt.h"
+
 enum class Theme { Dark, Light, Amoled };
 
 struct Settings {
@@ -14,8 +16,11 @@ struct Settings {
     bool touch = true;     // the touch screen
     bool qr_login = false; // experimental: log in by scanning a QR code
     bool videos = false;   // experimental: play videos in chat, send album clips
+    bool clock24 = true;   // 24-hour times (else 12-hour with AM/PM)
+    DateFormat date_format = DateFormat::YMD;
 
     static const char *themeName(Theme t);  // "Dark", "Light", "AMOLED"
+    static const char *dateFormatName(DateFormat f);  // "YYYY-MM-DD"...
 
     std::string toJson() const;
     // Unknown or missing fields keep their defaults.

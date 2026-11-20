@@ -27,7 +27,12 @@ uint64_t nowMs();
 inline uint64_t snowflakeUnixMs(uint64_t id) { return (id >> 22) + 1420070400000ULL; }
 // Formats a unix timestamp (seconds) in the console's time zone,
 // as "HH:MM" today or "YYYY-MM-DD HH:MM" otherwise.
-std::string formatTime(uint64_t unix_seconds);
+#include "util/datefmt.h"
+
+// "14:05" today, else "2025-03-01 14:05" (in the date order); with clock24 false, "2:05 PM".
+std::string formatTime(uint64_t unix_seconds, bool clock24 = true, DateFormat date = DateFormat::YMD);
+// The time of day: "14:05" or "2:05 PM" (with seconds: "14:05:09" / "2:05:09 PM").
+std::string clockText(int hour, int minute, bool clock24, int second = -1);
 // Wall-clock time in the console's time zone.
 struct LocalTime {
     int year, month, day, hour, minute, second, weekday;  // month 1-12, weekday 0 = Sunday

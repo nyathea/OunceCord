@@ -7,6 +7,8 @@
 // find them after wrapping and draw them highlighted. Platform-free.
 #pragma once
 
+#include "util/datefmt.h"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -51,6 +53,8 @@ MentionText resolveMentions(std::string_view content, const MentionLookup &looku
 struct CalendarTime {
     int year, month, day, hour, minute, second, weekday;  // month 1-12, weekday 0 = Sunday
 };
-std::string formatTimestamp(int64_t when, int64_t now, char style, const CalendarTime &ct);
+// clock24 false: 12-hour times with AM/PM.
+std::string formatTimestamp(int64_t when, int64_t now, char style, const CalendarTime &ct, bool clock24 = true,
+                            DateFormat date = DateFormat::YMD);
 
 }  // namespace discord

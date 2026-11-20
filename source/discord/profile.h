@@ -4,6 +4,8 @@
 // badges, connected accounts, and the server-specific profile. Platform-free.
 #pragma once
 
+#include "util/datefmt.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -42,8 +44,8 @@ bool parseProfile(const json::Value &v, Snowflake user_id, Snowflake guild_id, U
 // A connection type's display name ("GitHub", "Steam"...).
 std::string connectionName(const std::string &type);
 // "2021-03-04T05:06:07.000000+00:00" -> "Mar 4, 2021"; empty if unparseable.
-std::string formatIsoDate(const std::string &iso);
+std::string formatIsoDate(const std::string &iso, DateFormat f = DateFormat::MDY);
 // The account's creation date from its ID, as "Mar 4, 2021".
-std::string snowflakeDate(Snowflake id);
+std::string snowflakeDate(Snowflake id, DateFormat f = DateFormat::MDY);
 
 }  // namespace discord

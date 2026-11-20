@@ -115,7 +115,20 @@ uint64_t nowMs()
     return armTicksToNs(armGetSystemTick()) / 1000000ULL;
 }
 
-std::string formatTime(uint64_t unix_seconds)
+std::string clockText(int hour, int minute, bool clock24, int second)
+{
+    char buf[24];
+    int h = clock24 ? hour : (hour % 12 == 0 ? 12 : hour % 12);
+    const char *fmt = clock24 ? "%02d:%02d" : "%d:%02d";
+    int n = snprintf(buf, sizeof(buf), fmt, h, minute);
+    if (second >= 0 && n > 0 && n < (int)sizeof(buf))
+        n += snprintf(buf + n, sizeof(buf) - n, ":%02d", second);
+    if (!clock24 && n > 0 && n < (int)sizeof(buf))
+        snprintf(buf + n, sizeof(buf) - n, hour < 12 ? " AM" : " PM");
+    return buf;
+}
+
+std::string formatTime(uint64_t unix_seconds, bool clock24, DateFormat date)
 {
     TimeCalendarTime ct{}, today{};
     TimeCalendarAdditionalInfo info{};
@@ -130,11 +143,8 @@ std::string formatTime(uint64_t unix_seconds)
     if (R_SUCCEEDED(timeGetCurrentTime(TimeType_Default, &now)))
         timeToCalendarTimeWithMyRule(now, &today, &info);
     if (ct.year == today.year && ct.month == today.month && ct.day == today.day)
-        snprintf(buf, sizeof(buf), "%02d:%02d", ct.hour, ct.minute);
-    else
-        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d", ct.year, ct.month, ct.day,
-                 ct.hour, ct.minute);
-    return buf;
+        return clockText(ct.hour, ct.minute, clock24);
+    return numericDate(ct.year, ct.month, ct.day, date) + " " + clockText(ct.hour, ct.minute, clock24);
 }
 
 bool localTime(int64_t unix_seconds, LocalTime &out)

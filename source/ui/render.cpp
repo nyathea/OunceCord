@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "ui/render.h"
 
+#include "util/sysinfo.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -155,6 +157,21 @@ bool Renderer::init()
         logf("render: eglChooseConfig failed 0x%x", eglGetError());
         return false;
     }
+#if defined(__SWITCH2__)
+    // Switch 2: draw at 1080p (the handheld screen's own resolution, and
+    // 1080p on a TV) instead of the default 1280x720. The UI keeps its
+    // 1280x720 layout and scales by 1.5, so text and pictures get sharper.
+    // Switch 1 stays at 720p.
+    if (SystemInfo::get().platform == "Ounce") {
+        Result rc = nwindowSetModeDimensions(nwindowGetDefault(), 1920, 1080, 1920, 1080);
+        if (R_FAILED(rc)) {
+            logf("render: nwindowSetModeDimensions failed 0x%x, trying a fixed size", rc);
+            rc = nwindowSetDimensions(nwindowGetDefault(), 1920, 1080);
+            if (R_FAILED(rc))
+                logf("render: nwindowSetDimensions failed 0x%x, staying at the default size", rc);
+        }
+    }
+#endif
     m_surface = eglCreateWindowSurface(m_display, config, nwindowGetDefault(), nullptr);
     if (m_surface == EGL_NO_SURFACE) {
         logf("render: eglCreateWindowSurface failed 0x%x", eglGetError());

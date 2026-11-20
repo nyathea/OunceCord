@@ -115,33 +115,29 @@ std::string connectionName(const std::string &type)
     return s;
 }
 
-static std::string dateText(int y, int m, int d)
+static std::string dateText(int y, int m, int d, DateFormat f)
 {
-    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     if (m < 1 || m > 12 || d < 1 || d > 31 || y < 2000)
         return {};
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%s %d, %d", months[m - 1], d, y);
-    return buf;
+    return longDate(y, m, d, f, true);
 }
 
-std::string formatIsoDate(const std::string &iso)
+std::string formatIsoDate(const std::string &iso, DateFormat f)
 {
     int y = 0, m = 0, d = 0;
     if (iso.size() < 10 || sscanf(iso.c_str(), "%4d-%2d-%2d", &y, &m, &d) != 3)
         return {};
-    return dateText(y, m, d);
+    return dateText(y, m, d, f);
 }
 
-std::string snowflakeDate(Snowflake id)
+std::string snowflakeDate(Snowflake id, DateFormat f)
 {
     if (!id)
         return {};
     time_t t = (time_t)(((id >> 22) + 1420070400000ULL) / 1000);
     struct tm tm{};
     gmtime_r(&t, &tm);
-    return dateText(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    return dateText(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, f);
 }
 
 }  // namespace discord

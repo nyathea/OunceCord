@@ -201,22 +201,35 @@ MentionText resolveMentions(std::string_view content, const MentionLookup &looku
     return out;
 }
 
-std::string formatTimestamp(int64_t when, int64_t now, char style, const CalendarTime &ct)
+namespace {
+std::string clock(int hour, int minute, int second, bool clock24)
 {
-    static const char *kMonths[] = {"January", "February", "March",     "April",   "May",      "June",
-                                    "July",    "August",   "September", "October", "November", "December"};
+    char buf[24];
+    int h = clock24 ? hour : (hour % 12 == 0 ? 12 : hour % 12);
+    if (second >= 0)
+        snprintf(buf, sizeof(buf), clock24 ? "%02d:%02d:%02d" : "%d:%02d:%02d", h, minute, second);
+    else
+        snprintf(buf, sizeof(buf), clock24 ? "%02d:%02d" : "%d:%02d", h, minute);
+    std::string s = buf;
+    if (!clock24)
+        s += hour < 12 ? " AM" : " PM";
+    return s;
+}
+}  // namespace
+
+std::string formatTimestamp(int64_t when, int64_t now, char style, const CalendarTime &ct, bool clock24,
+                            DateFormat date)
+{
     static const char *kDays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-    const char *month = kMonths[(ct.month - 1 + 12) % 12];
     char buf[96];
     switch (style) {
-    case 't': snprintf(buf, sizeof(buf), "%02d:%02d", ct.hour, ct.minute); break;
-    case 'T': snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute, ct.second); break;
-    case 'd': snprintf(buf, sizeof(buf), "%02d/%02d/%04d", ct.day, ct.month, ct.year); break;
-    case 'D': snprintf(buf, sizeof(buf), "%d %s %04d", ct.day, month, ct.year); break;
+    case 't': return clock(ct.hour, ct.minute, -1, clock24);
+    case 'T': return clock(ct.hour, ct.minute, ct.second, clock24);
+    case 'd': return numericDate(ct.year, ct.month, ct.day, date);
+    case 'D': return longDate(ct.year, ct.month, ct.day, date);
     case 'F':
-        snprintf(buf, sizeof(buf), "%s, %d %s %04d %02d:%02d", kDays[(ct.weekday % 7 + 7) % 7], ct.day, month,
-                 ct.year, ct.hour, ct.minute);
-        break;
+        return std::string(kDays[(ct.weekday % 7 + 7) % 7]) + ", " + longDate(ct.year, ct.month, ct.day, date) + " " +
+               clock(ct.hour, ct.minute, -1, clock24);
     case 'R': {
         int64_t d = when - now;
         bool future = d > 0;
@@ -238,8 +251,7 @@ std::string formatTimestamp(int64_t when, int64_t now, char style, const Calenda
         break;
     }
     default:  // 'f'
-        snprintf(buf, sizeof(buf), "%d %s %04d %02d:%02d", ct.day, month, ct.year, ct.hour, ct.minute);
-        break;
+        return longDate(ct.year, ct.month, ct.day, date) + " " + clock(ct.hour, ct.minute, -1, clock24);
     }
     return buf;
 }
