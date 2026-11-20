@@ -991,7 +991,7 @@ void App::drawEmojiPicker()
         if (GLuint tex = m_images.get(it.image))
             m_r.drawImage(tex, {f.x + 16, f.y + 9, 28, 28}, Shape::Rect);
         Renderer::Bold b(m_r);
-        m_r.drawText(f.x + 52, f.y + 13, m_r.ellipsize(it.name, 15, f.w / 2 - 60), 15, col::text);
+        drawLabel(f.x + 52, f.y + 13, it.name, 15, col::text, f.w / 2 - 60);
     }
     const char *hint = m_mouseMode || m_touching ? "Tap to add   Tap outside to close"
                                                  : "(A) Add   (L/R) Section   (X) Search   (Y) Send   (B) Done";
@@ -1257,7 +1257,7 @@ void App::drawProfile()
     float nw;
     {
         Renderer::Bold b(m_r);
-        nw = m_r.drawText(c.x + pad, y, m_r.ellipsize(m_profile.name, 22, inner - 80), 22, m_profile.color);
+        nw = drawLabel(c.x + pad, y, m_profile.name, 22, m_profile.color, inner - 80);
     }
     std::string tag = m_profile.webhook ? "WEBHOOK" : m_profile.bot ? "APP" : "";
     if (!tag.empty()) {
@@ -2019,7 +2019,7 @@ void App::drawForum(Rect area)
     float tw;
     {
         Renderer::Bold b(m_r);
-        tw = m_r.drawText(area.x + 46, area.y + 14, m_r.ellipsize(forum->name, 17, area.w / 2), 17, col::bright);
+        tw = drawLabel(area.x + 46, area.y + 14, forum->name, 17, col::bright, area.w / 2);
     }
     if (!forum->topic.empty()) {
         std::string topic = discord::emotesAsText(
@@ -2103,8 +2103,7 @@ void App::drawForum(Rect area)
         }
         {
             Renderer::Bold b(m_r);
-            float w = m_r.drawText(title_x, card.y + 12, m_r.ellipsize(post->name, 17, tw_max - (title_x - x) - 70), 17,
-                                   col::bright);
+            float w = drawLabel(title_x, card.y + 12, post->name, 17, col::bright, tw_max - (title_x - x) - 70);
             if (post->pinned()) {
                 Rect pin{title_x + w + 10, card.y + 13, m_r.measureText("Pinned", 12) + 14, 20};
                 m_r.fillRoundRect(pin, 10, col::accent);
@@ -3206,6 +3205,38 @@ void App::drawIcon(const char *name, Rect r, Color tint)
         m_r.drawImage(tex, r, Shape::Rect, tint);
 }
 
+float App::drawLabel(float x, float y, std::string_view text, float size, Color c, float max_w)
+{
+    bool plain = true;
+    for (char ch : text)
+        if ((unsigned char)ch >= 0x80 || ch == '<') {
+            plain = false;
+            break;
+        }
+    if (plain)
+        return m_r.drawText(x, y, max_w > 0 ? m_r.ellipsize(text, size, max_w) : std::string(text), size, c);
+    discord::EmoteText et = discord::extractEmotes(text, Renderer::kInlineFirst, Renderer::kInlineLast);
+    std::string s = max_w > 0 ? m_r.ellipsize(et.text, size, max_w) : std::move(et.text);
+    float w = m_r.drawText(x, y, s, size, c);
+    if (et.emotes.empty())
+        return w;
+    int px = 16;
+    while (px < size * Renderer::kInlineSize * m_r.scale() && px < 256)
+        px *= 2;
+    const float slot = size * Renderer::kInlineAdvance, es = size * Renderer::kInlineSize;
+    for (size_t i = 0; i < s.size();) {
+        size_t start = i;
+        uint32_t cp = utf8Next(s, i);
+        if (cp < Renderer::kInlineFirst || cp >= Renderer::kInlineFirst + et.emotes.size())
+            continue;
+        Rect r{x + m_r.measureText(std::string_view(s).substr(0, start), size) + (slot - es) / 2,
+               y + (m_r.lineHeight(size) - es) / 2, es, es};
+        if (GLuint tex = m_images.get(discord::emotePath(et.emotes[cp - Renderer::kInlineFirst], px)))
+            m_r.drawImage(tex, r, Shape::Rect);
+    }
+    return w;
+}
+
 void App::drawAvatar(float cx, float cy, float radius, const std::string &name, Snowflake id,
                      const std::string &icon)
 {
@@ -3358,7 +3389,7 @@ void App::drawChannelList(Rect area)
             x = ix + 26;
         }
         Renderer::Bold b(m_r, is_open || (is_sel && m_pane == Pane::Channels && !m_mouseMode));
-        m_r.drawText(x, r.y + 7, m_r.ellipsize(row.label, 16, r.x + r.w - x - 8), 16, tc);
+        drawLabel(x, r.y + 7, row.label, 16, tc, r.x + r.w - x - 8);
     }
     m_r.popClip();
 }
@@ -3385,7 +3416,7 @@ void App::drawUserPanel(Rect area)
     m_r.fillShape({sx - 5, sy - 5, 10, 10}, Shape::Circle, status_color);
     {
         Renderer::Bold b(m_r);
-        m_r.drawText(area.x + 54, area.y + 10, m_r.ellipsize(name, 15, area.w - 64 - 44), 15, col::bright);
+        drawLabel(area.x + 54, area.y + 10, name, 15, col::bright, area.w - 64 - 44);
     }
     m_r.drawText(area.x + 54, area.y + 30, status, 12, col::muted);
     // Settings: a gear, with (-) shown for controllers.
@@ -4245,7 +4276,8 @@ void App::rebuildLayout(float width)
             for (auto &c : r)
                 if (c == '\n')
                     c = ' ';
-            L.reply = m_r.ellipsize(r, 13, text_w);
+            L.reply = r;
+            L.reply_w = text_w;
         }
         const float img_max_w = std::min(400.0f, text_w), img_max_h = 300;
         auto addImage = [&](const std::string &source, const std::string &name, int sw, int sh, bool spoiler,
@@ -4400,7 +4432,7 @@ void App::drawMessages(Rect area)
         // "parent > thread", like Discord's header.
         drawIcon(thread_parent->isForum() ? "forum" : "hash", {tx0, area.y + 13, 22, 22}, col::muted);
         tx0 += 28;
-        float pw = m_r.drawText(tx0, area.y + 15, m_r.ellipsize(thread_parent->name, 16, area.w / 5), 16, col::muted);
+        float pw = drawLabel(tx0, area.y + 15, thread_parent->name, 16, col::muted, area.w / 5);
         tx0 += pw + 10;
         drawIcon("chevron", {tx0, area.y + 18, 12, 12}, col::faint);
         tx0 += 20;
@@ -4413,7 +4445,7 @@ void App::drawMessages(Rect area)
     float tw;
     {
         Renderer::Bold b(m_r);
-        tw = m_r.drawText(tx0, area.y + 14, m_r.ellipsize(title, 17, area.w / 2), 17, col::bright) + (tx0 - area.x - 18);
+        tw = drawLabel(tx0, area.y + 14, title, 17, col::bright, area.w / 2) + (tx0 - area.x - 18);
     }
     if (!ch->isDm() && !ch->isThread())
         title = "#" + ch->name;  // for the placeholder and the welcome line
@@ -4497,7 +4529,7 @@ void App::drawMessages(Rect area)
             if (!L.reply.empty()) {
                 m_r.fillRect({view.x + 34, cy + 8, 2, 12}, col::faint);
                 m_r.fillRect({view.x + 34, cy + 8, 28, 2}, col::faint);
-                m_r.drawText(tx, cy + 1, L.reply, 13, col::muted);
+                drawLabel(tx, cy + 1, L.reply, 13, col::muted, L.reply_w);
                 cy += 20;
             }
             Rect av{view.x + kMsgAvatarX - kMsgAvatarR, cy + 19 - kMsgAvatarR, kMsgAvatarR * 2, kMsgAvatarR * 2};
@@ -4513,7 +4545,7 @@ void App::drawMessages(Rect area)
             float nw;
             {
                 Renderer::Bold b(m_r);
-                nw = m_r.drawText(tx, cy, m_r.ellipsize(L.author, kTextSize, view.w / 2), kTextSize, L.author_color);
+                nw = drawLabel(tx, cy, L.author, kTextSize, L.author_color, view.w / 2);
             }
             m_r.drawText(tx + nw + 10, cy + 3, L.time, 12, col::faint);
             cy += lh;
@@ -4632,7 +4664,7 @@ void App::drawMessages(Rect area)
             drawIcon("thread", {r.x + 12, r.y + r.h / 2 - 10, 20, 20}, col::muted);
             {
                 Renderer::Bold b(m_r);
-                m_r.drawText(r.x + 42, r.y + 6, m_r.ellipsize(L.thread_name, 15, r.w - 54), 15, col::bright);
+                drawLabel(r.x + 42, r.y + 6, L.thread_name, 15, col::bright, r.w - 54);
             }
             m_r.drawText(r.x + 42, r.y + 26, m_r.ellipsize(L.thread_info, 13, r.w - 54), 13, col::link);
             float top = std::max(r.y, view.y), bottom = std::min(r.y + r.h, view.y + view.h);
@@ -4689,7 +4721,7 @@ void App::drawMessages(Rect area)
         m_r.fillRoundRect(b, 6, col::bg_panel);
         float w = m_r.drawText(b.x + 12, b.y + 6, "Replying to ", 13, col::muted);
         Renderer::Bold bold(m_r);
-        m_r.drawText(b.x + 12 + w, b.y + 6, m_r.ellipsize("@" + d->reply_name, 13, b.w - w - 60), 13, col::bright);
+        drawLabel(b.x + 12 + w, b.y + 6, "@" + d->reply_name, 13, col::bright, b.w - w - 60);
         Rect x = cancelReplyRect();
         if (hovering(x) || composeFocused(ComposeItem::CancelReply))
             m_r.fillRoundRect(x, 5, col::hover);

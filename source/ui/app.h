@@ -90,6 +90,7 @@ private:
         Color author_color;  // highest coloured role, else the normal name colour
         std::vector<std::pair<std::string, Color>> extras;  // reply/attachments/embeds
         std::string reply;
+        float reply_w = 0;   // width the reply line is cut to
         Color text_color;
         std::vector<ImageBlock> images;
         // The text (markdown laid out): styled runs at positions relative to
@@ -513,6 +514,9 @@ private:
     // Draws a built-in icon (tools/pack_assets.py) into r, tinted (masks are
     // white, so the tint is their colour). Nothing while it loads.
     void drawIcon(const char *name, Rect r, Color tint = Color(255, 255, 255));
+    // Text with its emoji drawn as Twemoji pictures (fonts have none), cut
+    // with "..." to max_w when that's above 0. Returns the width drawn.
+    float drawLabel(float x, float y, std::string_view text, float size, Color c, float max_w = 0);
     void drawAvatar(float cx, float cy, float radius, const std::string &name, Snowflake id,
                     const std::string &icon = {});
 };
