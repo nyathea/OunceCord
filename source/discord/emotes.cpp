@@ -142,7 +142,7 @@ std::string emotePath(const Emote &e, int size)
 {
     if (!e.unicode.empty()) {
         std::string name = twemojiName(e.unicode);
-        return name.empty() ? std::string() : "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/" + name + ".png";
+        return name.empty() ? std::string() : twemojiImage(name);
     }
     return "/emojis/" + std::to_string(e.id) + (e.animated ? ".gif" : ".png") + "?size=" + std::to_string(size) +
            "&quality=lossless";

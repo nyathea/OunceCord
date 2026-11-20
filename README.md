@@ -15,7 +15,7 @@ WIP Discord Client for Switch 2 (KaiHEN)
 
 ## Building
 
-Clone with the Lucide submodule (`git clone --recursive`, or `git submodule update --init` in an
+Clone with the Lucide and Twemoji submodules (`git clone --recursive`, or `git submodule update --init` in an
 existing clone), install the Switch 2 devkit ([ounce-devkit](https://github.com/ouncebrew/ounce-devkit)), then run:
 
 ```sh
@@ -24,7 +24,7 @@ make
 
 The fonts and icons are built in from `data/assets.bin`. After changing the font or icon lists in
 `tools/pack_assets.py`, regenerate it with `python3 tools/pack_assets.py` (it needs
-`pip install cairosvg pillow` to draw the icons).
+`pip install cairosvg fonttools pillow` to draw the icons and cut down the backup fonts).
 
 ## Signing in
 
@@ -39,9 +39,13 @@ Sound in videos is decoded by [fdk-aac](https://github.com/mstorsjo/fdk-aac) (v2
 `third_party/fdk-aac` under the Fraunhofer FDK AAC Codec Library license (see `third_party/fdk-aac/NOTICE`).
 It is built by the normal `make`.
 
-Emoji names and categories come from GitHub's [gemoji](https://github.com/github/gemoji) (MIT), packed into `data/assets.bin`; emoji images are [Twemoji](https://github.com/jdecked/twemoji) (CC-BY 4.0), loaded from jsDelivr.
+Emoji names and categories come from GitHub's [gemoji](https://github.com/github/gemoji) (MIT), packed into `data/assets.bin`; emoji images are [Twemoji](https://github.com/jdecked/twemoji) v15.1.0 (graphics CC-BY 4.0), built in from the `third_party/twemoji` submodule.
 
 Icons are from [Lucide](https://github.com/lucide-icons/lucide) (ISC), in the `third_party/lucide` submodule.
-The font is [Open Sans](https://github.com/googlefonts/opensans) (SIL Open Font License 1.1).
+The font is [Open Sans](https://github.com/googlefonts/opensans) (SIL Open Font License 1.1). Symbols and
+"fancy" letters it lacks come from cut-down copies of [DejaVu Sans](https://dejavu-fonts.github.io/)
+(Bitstream Vera license), [Noto Sans Math](https://github.com/notofonts/math) and
+[Noto Sans Symbols](https://github.com/notofonts/symbols) (both SIL Open Font License 1.1), in `font/fallback`
+with their licenses.
 
 Special Thanks to: [Paicord](https://github.com/llsc12/Paicord) which was used as a reference.

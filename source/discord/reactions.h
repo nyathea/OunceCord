@@ -18,6 +18,9 @@ std::string reactionRoute(const Reaction &r);
 std::string reactionImage(const Reaction &r, int size);
 // Twemoji's file name for an emoji ("1f44d", "1f468-200d-1f469-200d-1f467").
 std::string twemojiName(const std::string &emoji);
+// The picture for a Twemoji file name: the copy built into the app
+// ("local:asset/twemoji/1f44d"), or jsDelivr's when the app lacks it.
+std::string twemojiImage(const std::string &name);
 
 // Applies MESSAGE_REACTION_ADD / _REMOVE (emoji is the event's emoji
 // object). by_me: the current user reacted; their own events that only

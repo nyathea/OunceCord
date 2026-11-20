@@ -5,6 +5,7 @@
 #include <cstdio>
 
 #include "discord/emotes.h"
+#include "util/assets.h"
 
 namespace discord {
 
@@ -94,8 +95,25 @@ std::string reactionImage(const Reaction &r, int size)
         return emotePath(e, size);
     }
     std::string name = twemojiName(r.emoji_name);
-    if (name.empty())
-        return {};
+    return name.empty() ? std::string() : twemojiImage(name);
+}
+
+std::string twemojiImage(const std::string &name)
+{
+    if (!assets::get("twemoji/" + name).empty())
+        return "local:asset/twemoji/" + name;
+    // A few ZWJ sequences are named without their variation selectors
+    // ("1f441-200d-1f5e8" for the eye in a speech bubble).
+    std::string bare;
+    for (size_t i = 0; i < name.size();) {
+        size_t dash = name.find('-', i);
+        std::string part = name.substr(i, dash == std::string::npos ? std::string::npos : dash - i);
+        if (part != "fe0f")
+            bare += (bare.empty() ? "" : "-") + part;
+        i = dash == std::string::npos ? name.size() : dash + 1;
+    }
+    if (bare != name && !assets::get("twemoji/" + bare).empty())
+        return "local:asset/twemoji/" + bare;
     return "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/" + name + ".png";
 }
 

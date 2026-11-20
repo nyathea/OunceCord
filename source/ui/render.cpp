@@ -282,13 +282,19 @@ bool Renderer::initFonts()
     }
 
     // The built-in Open Sans next (when there's no user font, also its
-    // semibold for names and headings), then the system fonts for the
-    // characters it lacks (CJK, symbols, emoji).
+    // semibold for names and headings), then the built-in backup fonts for
+    // symbols and "fancy" letters, then the system fonts for the characters
+    // those lack (Japanese, Chinese, Korean). Emoji are drawn as pictures.
     std::string_view normal = assets::get("font/normal");
     bool user_font = !m_faces.empty();
     FT_Face face;
     if (!normal.empty() && loadMemoryFace(normal.data(), normal.size(), face))
         m_faces.push_back(face);
+    for (const char *name : {"font/fallback/symbols", "font/fallback/math", "font/fallback/enclosed"}) {
+        std::string_view data = assets::get(name);
+        if (!data.empty() && loadMemoryFace(data.data(), data.size(), face))
+            m_faces.push_back(face);
+    }
     const char *styled[4] = {nullptr, "font/semibold", "font/italic", "font/semibold-italic"};
     for (int k = 1; k < 4 && !user_font; k++) {
         std::string_view data = assets::get(styled[k]);

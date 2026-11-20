@@ -180,7 +180,7 @@ bool App::init()
     m_saver.start();
     discord::emoji::load(assets::get("emoji/table"));
     m_images.setLocalLoader([this](const std::string &path, std::string &data) {
-        // "local:asset/icon/..." are built in; other local images are album thumbnails.
+        // "local:asset/..." (icons, Twemoji) are built in; other local images are album thumbnails.
         if (path.compare(0, 12, "local:asset/") == 0) {
             std::string_view a = assets::get(std::string_view(path).substr(12));
             data.assign(a.data(), a.size());
@@ -666,7 +666,7 @@ void App::toggleReaction(size_t layout, size_t chip)
 
 namespace {
 constexpr float kEmojiCell = 44, kEmojiGap = 6, kEmojiHeaderH = 30, kEmojiTopH = 52, kEmojiFootH = 46;
-const char *kSmileUrl = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/1f642.png";
+const char *kSmileUrl = "local:asset/twemoji/1f642";
 
 bool containsNoCase(std::string_view hay, std::string_view needle)
 {
