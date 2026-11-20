@@ -15,7 +15,8 @@ WIP Discord Client for Switch 2 (KaiHEN)
 
 ## Building
 
-Install the Switch 2 devkit ([ounce-devkit](https://github.com/ouncebrew/ounce-devkit)), then run:
+Clone with the Lucide submodule (`git clone --recursive`, or `git submodule update --init` in an
+existing clone), install the Switch 2 devkit ([ounce-devkit](https://github.com/ouncebrew/ounce-devkit)), then run:
 
 ```sh
 make
@@ -23,9 +24,9 @@ make
 
 This produces `OunceCord.nro`. Copy it to `sdmc:/switch/` and launch it from hbmenu.
 
-The fonts and icons are built in from `data/assets.bin`. After changing the icon list in
-`tools/pack_assets.py` (or the files in `font/` and `assets/`), regenerate it with
-`python3 tools/pack_assets.py`.
+The fonts and icons are built in from `data/assets.bin`. After changing the font or icon lists in
+`tools/pack_assets.py`, regenerate it with `python3 tools/pack_assets.py` (it needs
+`pip install cairosvg pillow` to draw the icons).
 
 ## Signing in
 
@@ -41,5 +42,8 @@ Sound in videos is decoded by [fdk-aac](https://github.com/mstorsjo/fdk-aac) (v2
 It is built by the normal `make`.
 
 Emoji names and categories come from GitHub's [gemoji](https://github.com/github/gemoji) (MIT), packed into `data/assets.bin`; emoji images are [Twemoji](https://github.com/jdecked/twemoji) (CC-BY 4.0), loaded from jsDelivr.
+
+Icons are from [Lucide](https://github.com/lucide-icons/lucide) (ISC), in the `third_party/lucide` submodule.
+The font is [Open Sans](https://github.com/googlefonts/opensans) (SIL Open Font License 1.1).
 
 Special Thanks to: [Paicord](https://github.com/llsc12/Paicord) which was used as a reference.

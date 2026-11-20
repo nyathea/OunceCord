@@ -3269,8 +3269,8 @@ void App::drawGuildBar(Rect area)
         }
         m_r.fillShape(icon, Shape::Squircle, bg);
         if (i == 0) {
-            // Direct messages: the Discord logo, like the official home button.
-            drawIcon("discord", {cx - 15, cy - 15, 30, 30}, is_sel || is_hover ? col::on_accent : col::text);
+            // Direct messages.
+            drawIcon("home", {cx - 15, cy - 15, 30, 30}, is_sel || is_hover ? col::on_accent : col::text);
             m_r.fillRect({area.x + 18, y + item + 1, area.w - 36, 2}, col::bg_input);
             continue;
         }
@@ -3370,19 +3370,19 @@ void App::drawUserPanel(Rect area)
     std::string name = m_client.ready() ? me.displayName() : "...";
     drawAvatar(area.x + 28, area.y + area.h / 2, 16, name, me.id,
                m_client.ready() ? discord::cdn::avatarPath(me) : std::string());
-    const char *status_icon = "status/idle";
+    Color status_color = col::warn;
     std::string status = "Connecting";
     switch (m_client.status()) {
-    case discord::GatewayStatus::Connected: status_icon = "status/online"; status = "Online"; break;
+    case discord::GatewayStatus::Connected: status_color = col::online; status = "Online"; break;
     case discord::GatewayStatus::Reconnecting: status = "Reconnecting"; break;
     case discord::GatewayStatus::Fatal:
-    case discord::GatewayStatus::AuthFailed: status_icon = "status/offline"; status = "Disconnected"; break;
+    case discord::GatewayStatus::AuthFailed: status_color = col::faint; status = "Disconnected"; break;
     default: break;
     }
     // Status on the avatar's corner, like Discord.
     float sx = area.x + 40, sy = area.y + area.h / 2 + 11;
     m_r.fillShape({sx - 7, sy - 7, 14, 14}, Shape::Circle, col::bg_panel);
-    drawIcon(status_icon, {sx - 5, sy - 5, 10, 10});
+    m_r.fillShape({sx - 5, sy - 5, 10, 10}, Shape::Circle, status_color);
     {
         Renderer::Bold b(m_r);
         m_r.drawText(area.x + 54, area.y + 10, m_r.ellipsize(name, 15, area.w - 64 - 44), 15, col::bright);

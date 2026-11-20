@@ -66,7 +66,7 @@ public:
     float measureText(std::string_view text, float size);
     float lineHeight(float size) const { return size * 1.3f; }
     float ascent(float size) const { return size * 0.95f; }
-    // Semibold and/or italic text (built-in gg sans) for the drawing and
+    // Semibold and/or italic text (built-in Open Sans) for the drawing and
     // measuring done while one of these is alive; characters those faces
     // lack fall back to the regular chain.
     enum StyleBits { kBold = 1, kItalic = 2 };

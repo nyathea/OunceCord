@@ -281,7 +281,7 @@ bool Renderer::initFonts()
         fclose(f);
     }
 
-    // The built-in gg sans next (when there's no user font, also its
+    // The built-in Open Sans next (when there's no user font, also its
     // semibold for names and headings), then the system fonts for the
     // characters it lacks (CJK, symbols, emoji).
     std::string_view normal = assets::get("font/normal");
