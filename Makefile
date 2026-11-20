@@ -45,8 +45,8 @@ SOURCES		:=	source source/net source/discord source/media source/ui source/util
 DATA		:=	data
 INCLUDES	:=	source
 APP_TITLE	:=	OunceCord
-APP_AUTHOR	:=	thea
-APP_VERSION	:=	0.1.0
+APP_AUTHOR	:=	nyathea
+APP_VERSION	:=	0.1-beta
 
 #---------------------------------------------------------------------------------
 # options for code generation
