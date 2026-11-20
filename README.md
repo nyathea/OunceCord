@@ -3,7 +3,7 @@ WIP Discord Client for Switch 2 (KaiHEN)
 
 > [!WARNING]
 >
-> All 3rd-party clients are technically against Discord's ToS and could result in your account being banned. while this app pretends to be Discord as much as possible. there is still a bgi risk.
+> All 3rd-party clients are technically against Discord's ToS and could result in your account being banned. while this app pretends to be Discord as much as possible. there is still a big risk.
 
 ## Current Features
 
@@ -11,7 +11,7 @@ WIP Discord Client for Switch 2 (KaiHEN)
 - Sending messages
 - Reactions under messages
 - Sending screenshots and video clips from the console's album
-- Playing videos in chat (MP4/MOV with H.264, with sound) on the console's hardware video decoder.
+- Playing videos in chat on the console's hardware video decoder.
 
 ## Building
 
@@ -21,8 +21,6 @@ existing clone), install the Switch 2 devkit ([ounce-devkit](https://github.com/
 ```sh
 make
 ```
-
-This produces `OunceCord.nro`. Copy it to `sdmc:/switch/` and launch it from hbmenu.
 
 The fonts and icons are built in from `data/assets.bin`. After changing the font or icon lists in
 `tools/pack_assets.py`, regenerate it with `python3 tools/pack_assets.py` (it needs
