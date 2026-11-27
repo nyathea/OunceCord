@@ -49,6 +49,12 @@ void Gateway::setToken(std::string token)
     m_token = std::move(token);
 }
 
+void Gateway::setPresence(std::string status)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_presence = std::move(status);
+}
+
 void Gateway::send(json::Value payload)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -70,10 +76,10 @@ void Gateway::resetZlib()
     m_zbuf.clear();
 }
 
-void Gateway::sleepFor(uint64_t ms)
+void Gateway::sleepFor(uint64_t ms, bool kickable)
 {
     uint64_t until = nowMs() + ms;
-    while (m_running && nowMs() < until)
+    while (m_running && nowMs() < until && !(kickable && m_kick))
         svcSleepThread(50000000LL);
 }
 
@@ -138,13 +144,14 @@ bool Gateway::inflateMessage(const std::string &in, std::string &out)
 void Gateway::sendIdentify()
 {
     using json::Value;
-    std::string token;
+    std::string token, status;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         token = m_token;
+        status = m_presence;
     }
     Value presence = Value::object();
-    presence.set("status", Value::string("unknown"));
+    presence.set("status", Value::string(status.empty() ? "unknown" : status));
     presence.set("since", Value::number((int64_t)0));
     presence.set("activities", Value::array());
     presence.set("afk", Value::boolean(false));
@@ -293,6 +300,7 @@ bool Gateway::runConnection(bool &resumable)
         status(GatewayStatus::Reconnecting, error);
         return true;
     }
+    m_kick = false;  // this connection is new enough
     resetZlib();
     m_sendTimes.clear();  // the send limit is per connection
     {
@@ -303,6 +311,12 @@ bool Gateway::runConnection(bool &resumable)
     bool reconnect_now = false;
     m_nextHeartbeat = UINT64_MAX;
     while (m_running && !reconnect_now) {
+        if (m_kick) {  // run() clears it
+            logf("gateway: reconnecting now (woke from sleep)");
+            m_ws.close(4000);
+            resumable = true;
+            return true;
+        }
         uint64_t now = nowMs();
         if (now >= m_nextHeartbeat) {
             if (m_ackPending) {
@@ -388,6 +402,8 @@ void Gateway::run()
             failures++;
         else
             failures = 0;
+        if (m_kick)
+            failures = 0;  // a wake, not a failing connection
         uint64_t delay = failures == 0 ? 1000 : std::min<uint64_t>(1000ULL << std::min(failures, 6), 60000);
         if (m_rateLimitedClose)
             delay = std::max<uint64_t>(delay, 15000);
@@ -407,7 +423,9 @@ void Gateway::run()
             }
         }
         logf("gateway: reconnecting in %llu ms", (unsigned long long)delay);
-        sleepFor(delay);
+        bool id_limited = (!resumable || m_sessionId.empty()) && identifyWaitMs() > 0;
+        sleepFor(delay, !id_limited);
+        m_kick = false;
     }
     m_ws.close();
     if (m_zsReady) {

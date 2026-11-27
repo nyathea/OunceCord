@@ -14,6 +14,9 @@ constexpr const char *kHost = "cdn.discordapp.com";
 
 // The user's avatar, or the default avatar Discord assigns them.
 std::string avatarPath(const User &u, int size = 64);
+// The animated version of an avatar or banner path: an "a_" hash asks
+// for .gif instead of .png. Other paths come back unchanged.
+std::string animatedPath(const std::string &path);
 // Empty when the server has no icon.
 std::string guildIconPath(const Guild &g, int size = 128);
 // Group DM icon, or the other person's avatar for a 1:1 DM. Empty if none.

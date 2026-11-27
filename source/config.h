@@ -20,6 +20,8 @@ constexpr const char *kIdentityPath = "sdmc:/switch/OunceCord/identity.json";
 constexpr const char *kSavedDir = "sdmc:/switch/OunceCord/Saved";
 // Settings chosen in the app.
 constexpr const char *kSettingsPath = "sdmc:/switch/OunceCord/settings.json";
+// The server and channel open when the app last ran, reopened on launch.
+constexpr const char *kLastPlacePath = "sdmc:/switch/OunceCord/last.json";
 
 void ensureDir();
 // The saved token, trimmed, or empty. Accepts a token with or without

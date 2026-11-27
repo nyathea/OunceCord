@@ -17,12 +17,14 @@ public:
         std::string data;
     };
 
+    // TLS to host:port (voice servers may use ports other than 443).
     bool connect(const std::string &host, const std::string &path, const HttpHeaders &headers,
-                 std::string *error);
+                 std::string *error, int port = 443);
     void close(uint16_t code = 1000);
     bool isOpen() const { return m_socket.isOpen(); }
 
     bool sendText(const std::string &text);
+    bool sendBinary(const std::string &data);
     // Waits up to timeout_ms for a complete message. Pings are answered here.
     Result receive(Message &out, uint32_t timeout_ms);
     // Close code the server sent, when receive returned Closed (0 if none).

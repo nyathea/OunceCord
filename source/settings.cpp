@@ -34,6 +34,9 @@ std::string Settings::toJson() const
     v.set("date_format", json::Value::string(date_format == DateFormat::MDY   ? "mdy"
                                              : date_format == DateFormat::DMY ? "dmy"
                                                                               : "ymd"));
+    v.set("status", json::Value::string(status));
+    v.set("self_mute", json::Value::boolean(self_mute));
+    v.set("self_deaf", json::Value::boolean(self_deaf));
     return v.dump();
 }
 
@@ -63,6 +66,13 @@ Settings Settings::fromJson(const std::string &text)
         s.date_format = DateFormat::MDY;
     else if (df == "dmy")
         s.date_format = DateFormat::DMY;
+    std::string st = v["status"].str();
+    if (st == "online" || st == "idle" || st == "dnd" || st == "invisible")
+        s.status = st;
+    if (v["self_mute"].isBool())
+        s.self_mute = v["self_mute"].asBool();
+    if (v["self_deaf"].isBool())
+        s.self_deaf = v["self_deaf"].asBool();
     return s;
 }
 

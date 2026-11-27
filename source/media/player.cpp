@@ -31,7 +31,7 @@ std::string hexString(Result rc)
 
 VideoPlayer::~VideoPlayer() { close(); }
 
-bool VideoPlayer::open(std::shared_ptr<MediaSource> source, std::string &error)
+bool VideoPlayer::open(std::shared_ptr<MediaSource> source, std::string &error, bool sound)
 {
     close();
     m_source = std::move(source);
@@ -79,7 +79,9 @@ bool VideoPlayer::open(std::shared_ptr<MediaSource> source, std::string &error)
         }
         m_decoder = d;
     }
-    if (m_file.audio >= 0) {
+    if (m_file.audio >= 0 && !sound) {
+        logf("player: no sound: in a voice call");
+    } else if (m_file.audio >= 0) {
         const mp4::Track &a = m_file.tracks[m_file.audio];
         if (a.object_type == 0x40 && !a.asc.empty()) {
             logf("player: starting audio out");

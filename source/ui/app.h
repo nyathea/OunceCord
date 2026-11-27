@@ -57,6 +57,8 @@ private:
         std::string icon;     // CDN path for DMs
         const char *kind = nullptr;  // built-in icon before the name ("hash", "voice"...)
         int indent = 0;              // threads sit under their channel
+        bool member = false;  // someone in the voice channel above (id: the user), not selectable
+        bool selectable() const { return !header && !member; }
     };
 
     // A picture in a message (attachment or embed image).
@@ -195,6 +197,24 @@ private:
     Snowflake m_openForum = 0;
     // A thread opened from a message: B goes back to that channel.
     Snowflake m_threadReturn = 0;
+    // Where the user last was: saved so the next launch reopens it, and used
+    // to put a thread back after a reconnect drops it from the lists.
+    struct LastPlace {
+        Snowflake user = 0, guild = 0, channel = 0;
+        Snowflake parent = 0;  // a thread's channel or forum
+        Snowflake ret = 0;     // the channel a thread was opened from
+        std::string name;      // a thread's name
+    };
+    LastPlace m_place;
+    bool m_restorePending = false;  // reopen m_place once the client is ready
+    uint64_t m_restoreSince = 0;
+    uint32_t m_seenConnections = 0;
+    bool m_woke = false;  // set by the applet hook on resume from sleep
+    AppletHookCookie m_appletHook{};
+    static void onAppletHook(AppletHookType type, void *param);
+    void trackPlace();
+    void restorePlace();
+    void refreshAfterReconnect();
     int m_forumIndex = 0;
     float m_forumScroll = 0, m_forumContentH = 0;
     bool m_forumScrollPending = false;
@@ -209,6 +229,7 @@ private:
     void drawForum(Rect area);
     std::vector<ChannelRow> m_rows;
     uint32_t m_rowsVersion = ~0u;
+    uint32_t m_rowsVoiceVersion = ~0u;
     int m_rowsGuild = -1;
 
     // Messages pane.
@@ -228,16 +249,66 @@ private:
     Part m_selPart;                       // part of the highlighted message with focus
     bool m_composeFocus = false;          // focus is in the text box row
     ComposeItem m_composeSel = ComposeItem::Text;
-    bool m_gearFocus = false;             // the settings gear, below the channel list
+    // Buttons below the channel list: Disconnect on the voice panel (while
+    // in a call), then Mute, Deafen and Settings on the user panel.
+    enum class PanelFocus { None, Disconnect, Status, Mute, Deafen, Gear };
+    PanelFocus m_panelFocus = PanelFocus::None;
+    // The channel list is one block for the controller until (A) goes into
+    // it, so Down reaches the panel buttons below it at once.
+    bool m_channelsEntered = false;
+    bool panelFocused() const { return m_panelFocus != PanelFocus::None; }
+    void activatePanel(PanelFocus f);
+    void drawVoicePanel(Rect area);
+    void drawPanelButton(PanelFocus f, const char *icon, bool off);
+    void drawVoiceMember(const Guild &g, Snowflake user_id, Rect r, const std::set<Snowflake> &speaking);
+    float bottomPanelH() const;  // user panel, plus the voice panel in a call
+    Rect panelButtonRect(PanelFocus f) const;
     std::vector<Part> messageParts(size_t layout) const;
     bool partFocused(size_t layout, PartKind kind, size_t index = 0) const;
-    bool stepPart(int dir);     // false at either end
+    bool stepPart(int dir);     // along the focused row; false at either end
+    // Controller focus moves like on a web page: up/down go to the row
+    // above or below (within a message, then the next message, then the
+    // text box row), landing on what is nearest to the column we came from.
+    struct NavSpot {
+        Part part;            // in a message
+        ComposeItem item{};   // in the text box rows
+        float x = 0;          // centre, on screen
+        int row = 0;          // top to bottom within the message (or text box rows)
+    };
+    static int stepInRow(const std::vector<NavSpot> &spots, size_t at, int dir);
+    static int nearestInRow(const std::vector<NavSpot> &spots, int row, float x);
+    std::vector<NavSpot> messageSpots(size_t layout) const;
+    std::vector<NavSpot> composeSpots();
+    struct NavKey {
+        bool compose = false;
+        ComposeItem item{};
+        Snowflake message = 0;
+        Part part;
+        bool operator==(const NavKey &o) const
+        {
+            return compose == o.compose && (compose ? item == o.item : message == o.message && part == o.part);
+        }
+    };
+    NavKey navKey() const;
+    float focusX();
+    float m_navX = 0;     // the column up/down keeps to
+    NavKey m_navAt;       // where m_navX was last set (recomputed if focus moved some other way)
+    bool m_navValid = false;
+    void moveSpatial(int dir);
+    void selectMessageAt(int layout, Part part);
+    int newestVisibleMessage() const;
     void activatePart();
     std::vector<ComposeItem> composeItems();
     bool composeFocused(ComposeItem item) const;
-    bool stepCompose(int dir);  // false at either end
+    bool stepCompose(int dir);  // along the focused row; false at either end
     void composeActivate(ComposeItem item);
-    void drawFocusRing(Rect r);
+    // The controller's focus: an animated gradient outline just outside
+    // what has the focus, following its shape (round, squircle or rounded box).
+    // r is the focused thing's own rectangle and radius its own corner
+    // radius, so the outline keeps the same distance from it all round.
+    void drawFocusRing(Rect r, float radius);
+    void drawFocusCircle(float cx, float cy, float radius);
+    void drawFocusShape(Rect r, Shape shape, float radius = 0);
     // Profile card for a message's author.
     struct Profile {
         Snowflake id = 0, guild = 0;
@@ -413,6 +484,10 @@ private:
     void openSettingsPage(SettingPage page);
     void settingsBack();  // to the main page, or closes
     Rect settingsBackRect() const;
+    // The back arrow in the chat header, in a forum post or a thread opened
+    // from a channel (to return to the forum or the channel).
+    bool hasMessagesBack() const;
+    Rect messagesBackRect() const;
     std::vector<SettingItem> settingItems() const;  // in screen space (scrolled)
     Rect settingsListRect() const;  // the scrolling part, under the title
     float m_settingsScroll = 0, m_settingsContentH = 0;
@@ -448,6 +523,17 @@ private:
     void openComposeMenu();
     void composeMenuChoose(ComposeAction a);
     void handleComposeMenuInput(u64 down);
+    // The status menu, opened from the avatar and name in the user panel.
+    bool m_statusMenuOpen = false;
+    int m_statusMenuIndex = 0;
+    Rect statusMenuRect() const;
+    Rect statusMenuItemRect(int i) const;
+    void handleStatusMenuInput(u64 down);
+    void drawStatusMenu();
+    void chooseStatus(int i);
+    void saveVoiceButtons();
+    // Discord's status marks: a dot, a moon, a bar, a ring.
+    void drawStatusDot(float cx, float cy, float r, const std::string &status, Color bg);
     void drawComposeMenu();
     void drawChip(Rect r, const MessageLayout::Chip &c, bool focus);
     void startReply(size_t layout);  // shows the "Replying to" bar

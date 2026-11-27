@@ -41,7 +41,7 @@ include $(DEVKITPRO)/libounce/switch2_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	OunceCord
 BUILD		:=	build
-SOURCES		:=	source source/net source/discord source/media source/ui source/util
+SOURCES		:=	source source/net source/discord source/media source/ui source/util source/voice
 DATA		:=	data
 INCLUDES	:=	source
 APP_TITLE	:=	OunceCord
@@ -63,7 +63,7 @@ CXXFLAGS	:= $(CFLAGS) -std=gnu++20 -fno-rtti -fno-exceptions
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lfdk-aac -lEGL -lfreetype -lharfbuzz -lfreetype -lpng -lturbojpeg -lbz2 -lz -lnx
+LIBS	:= -ldave -lcrypto -lopus -lfdk-aac -lEGL -lfreetype -lharfbuzz -lfreetype -lpng -lturbojpeg -lbz2 -lz -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
@@ -114,9 +114,10 @@ export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
 export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 			-I$(CURDIR)/third_party/fdk-aac/libAACdec/include -I$(CURDIR)/third_party/fdk-aac/libSYS/include \
 			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+			-I$(CURDIR)/.voice-deps/prefix/include \
 			-I$(CURDIR)/$(BUILD)
 
-export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib) -L$(CURDIR)/$(BUILD)/fdk-aac
+export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib) -L$(CURDIR)/$(BUILD)/fdk-aac -L$(CURDIR)/.voice-deps/prefix/lib
 
 ifeq ($(strip $(CONFIG_JSON)),)
 	jsons := $(wildcard *.json)
@@ -168,6 +169,8 @@ all: $(BUILD)
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -f $(CURDIR)/third_party/fdk-aac.mk OUT=$(BUILD)/fdk-aac
+	@DEVKITPRO=$(DEVKITPRO) $(CURDIR)/tools/voice/build_deps.sh
+	@sh $(CURDIR)/tools/build_info.sh $(CURDIR)/$(BUILD)/build_info.h $(CURDIR)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 #---------------------------------------------------------------------------------

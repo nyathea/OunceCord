@@ -34,6 +34,7 @@ struct UserProfile {
     std::vector<Badge> badges;
     std::string joined_server;  // ISO 8601, empty when unknown
     int mutual_servers = -1;    // -1: unknown
+    std::vector<Snowflake> mutual_guild_ids;
 };
 
 // The request path for a user's profile, with their server profile when

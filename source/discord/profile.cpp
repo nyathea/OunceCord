@@ -89,8 +89,12 @@ bool parseProfile(const json::Value &v, Snowflake user_id, Snowflake guild_id, U
         out.badges.push_back(badge);
     }
     out.joined_server = v["guild_member"]["joined_at"].str();
-    if (v["mutual_guilds"].isArray())
+    if (v["mutual_guilds"].isArray()) {
         out.mutual_servers = (int)v["mutual_guilds"].size();
+        for (const auto &g : v["mutual_guilds"].items())
+            if (Snowflake id = g["id"].asId())
+                out.mutual_guild_ids.push_back(id);
+    }
     return true;
 }
 

@@ -18,6 +18,9 @@ constexpr uint64_t ManageMessages = 1ULL << 13;
 constexpr uint64_t ViewChannel = 1ULL << 10;
 constexpr uint64_t SendMessages = 1ULL << 11;
 constexpr uint64_t ReadMessageHistory = 1ULL << 16;
+constexpr uint64_t Connect = 1ULL << 20;
+constexpr uint64_t Speak = 1ULL << 21;
+constexpr uint64_t MoveMembers = 1ULL << 24;
 constexpr uint64_t ManageThreads = 1ULL << 34;
 constexpr uint64_t SendMessagesInThreads = 1ULL << 38;
 constexpr uint64_t All = ~0ULL;
@@ -76,6 +79,21 @@ struct GuildEmoji {
 struct Member {
     std::string nick;
     std::vector<Snowflake> roles;
+    User user;  // id 0 until a member object with the user came
+};
+
+// Someone in a voice channel (VOICE_STATE_UPDATE, and the guild's
+// voice_states).
+struct VoiceState {
+    Snowflake user_id = 0;
+    Snowflake channel_id = 0;
+    std::string session_id;
+    bool mute = false, deaf = false;            // by a moderator
+    bool self_mute = false, self_deaf = false;
+    bool self_stream = false, self_video = false;
+    bool suppress = false;                      // stage audience
+
+    static VoiceState fromJson(const json::Value &v);
 };
 
 struct Overwrite {
@@ -153,6 +171,7 @@ struct Guild {
     std::vector<GuildEmoji> emojis;
     // Members we have seen (message authors, member chunks...), by user id.
     std::map<Snowflake, Member> members;
+    std::map<Snowflake, VoiceState> voice_states;  // by user, only those in a channel
     bool unavailable = false;
 
     void applyJson(const json::Value &v);
@@ -167,6 +186,11 @@ struct Guild {
     // GUILD_MEMBERS_CHUNK...). user_id is used when the object has no user.
     void setMember(const json::Value &m, Snowflake user_id = 0);
     const Member *member(Snowflake user_id) const;
+    // Applies a voice state (removing it when channel_id is null), with its
+    // member object if any. Returns the user's previous channel (0: none).
+    Snowflake applyVoiceState(const json::Value &v);
+    // Who is in a voice channel, in the order they joined (by user id).
+    std::vector<const VoiceState *> voiceIn(Snowflake channel_id) const;
     // The name to show for a user here: nickname, else display name.
     std::string nameFor(const User &u) const;
     // The colour of the user's highest coloured role, or 0.

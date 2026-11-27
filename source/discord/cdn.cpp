@@ -27,6 +27,20 @@ std::string avatarPath(const User &u, int size)
     return "/embed/avatars/" + std::to_string(index) + ".png";
 }
 
+std::string animatedPath(const std::string &path)
+{
+    size_t q = path.find('?');
+    size_t slash = path.rfind('/', q);
+    if (slash == std::string::npos || path.compare(slash + 1, 2, "a_") != 0)
+        return path;
+    size_t ext = path.find(".png", slash);
+    if (ext == std::string::npos || (q != std::string::npos && ext > q))
+        return path;
+    std::string out = path;
+    out.replace(ext, 4, ".gif");
+    return out;
+}
+
 std::string guildIconPath(const Guild &g, int size)
 {
     if (g.icon.empty())

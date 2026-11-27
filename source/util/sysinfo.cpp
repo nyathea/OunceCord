@@ -13,10 +13,23 @@
 #define APP_VERSION "unknown"
 #endif
 
+// Written on each build by tools/build_info.sh (build/build_info.h).
+#if __has_include("build_info.h")
+#include "build_info.h"
+#endif
+#ifndef BUILD_DATE
+#define BUILD_DATE "Unknown"
+#endif
+#ifndef BUILD_COMMIT
+#define BUILD_COMMIT "Unknown"
+#endif
+
 static SystemInfo detect()
 {
     SystemInfo info;
     info.app = APP_VERSION;
+    info.build_date = BUILD_DATE;
+    info.commit = BUILD_COMMIT;
 
     // The real system version and platform name come from set:sys. (On
     // Switch 2, hosversionGet() is pinned to 20.0.0.)
