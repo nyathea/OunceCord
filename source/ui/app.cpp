@@ -93,8 +93,9 @@ void applyTheme(Theme t)
         bg_channels = Color::hex(0x000000);
         bg_messages = Color::hex(0x000000);
         bg_panel = Color::hex(0x0b0b0c);
-        // Dark gray, so panels stand out from the black behind them.
-        bg_card = Color::hex(0x121214);
+        // Very dark gray: panels (settings, pickers) stand out a little from
+        // the black behind them.
+        bg_card = Color::hex(0x0b0b0c);
         bg_input = Color::hex(0x1a1b1e);
         selected = Color::hex(0x26272b);
         hover = Color::hex(0x17181a);
@@ -121,6 +122,12 @@ constexpr float kChipH = 26, kChipGap = 6, kChipEmoji = 18;
 // Messages: avatar radius, its centre and the text column, from the pane's left edge.
 constexpr float kMsgAvatarR = 22, kMsgAvatarX = 38, kMsgTextX = 74;
 constexpr float kUserPanelH = 56;
+constexpr float kVoicePanelH = 60;  // call status above the user panel
+// How far the focus outline reaches outside what it surrounds (gap 2,
+// thickness 3, antialiased edge), plus a little room: scrolling lists keep
+// this much space at their edges so the outline isn't cut off.
+constexpr float kFocusPad = 8;
+constexpr int kAboutRows = 6;  // Settings > About: app version, build date, commit, HOS, platform, environment
 
 constexpr float kTextSize = 17;
 constexpr float kSmallSize = 14;
@@ -206,14 +213,148 @@ bool App::init()
         logf("app: token refreshed and saved");
     };
 
+    appletHook(&m_appletHook, onAppletHook, this);
+
+    // Where the user was last time, reopened once the client is ready.
+    {
+        std::string text;
+        json::Value v;
+        if (config::readText(config::kLastPlacePath, text) && json::parse(text, v) && v.isObject()) {
+            m_place.user = v["user"].asId();
+            m_place.guild = v["guild"].asId();
+            m_place.channel = v["channel"].asId();
+            m_place.parent = v["parent"].asId();
+            m_place.ret = v["return"].asId();
+            m_place.name = v["name"].str();
+        }
+    }
+
     m_token = config::loadToken();
     if (!m_token.empty())
         startClient();
     return true;
 }
 
+void App::onAppletHook(AppletHookType type, void *param)
+{
+    if (type == AppletHookType_OnResume)
+        static_cast<App *>(param)->m_woke = true;
+}
+
+void App::trackPlace()
+{
+    Snowflake ch = m_openChannel ? m_openChannel : m_openForum;
+    Snowflake ret = m_openChannel ? m_threadReturn : 0;
+    if (!ch || m_restorePending || !m_client.ready())
+        return;
+    if (ch == m_place.channel && ret == m_place.ret && m_client.me().id == m_place.user)
+        return;
+    Channel *c = m_client.findChannel(ch);
+    if (!c)
+        return;
+    LastPlace p;
+    p.user = m_client.me().id;
+    p.guild = c->guild_id;
+    p.channel = ch;
+    p.parent = c->isThread() ? c->parent_id : 0;
+    p.ret = ret;
+    p.name = c->isThread() ? c->name : "";
+    m_place = p;
+    json::Value v = json::Value::object();
+    v.set("user", json::Value::string(std::to_string(p.user)));
+    v.set("guild", json::Value::string(std::to_string(p.guild)));
+    v.set("channel", json::Value::string(std::to_string(p.channel)));
+    v.set("parent", json::Value::string(std::to_string(p.parent)));
+    v.set("return", json::Value::string(std::to_string(p.ret)));
+    v.set("name", json::Value::string(p.name));
+    config::ensureDir();
+    if (!config::writeText(config::kLastPlacePath, v.dump()))
+        logf("app: couldn't save the last channel");
+}
+
+void App::restorePlace()
+{
+    uint64_t now = nowMs();
+    if (!m_restoreSince)
+        m_restoreSince = now;
+    const LastPlace p = m_place;
+    if (!p.channel || p.user != m_client.me().id || m_openChannel || m_openForum) {
+        m_restorePending = false;
+        return;
+    }
+    Channel *c = m_client.findChannel(p.channel);
+    if (!c && p.parent && m_client.findChannel(p.parent)) {
+        // A thread or forum post that READY didn't list: add it back.
+        m_client.ensureThread(p.channel, p.parent, p.guild, p.name);
+        c = m_client.findChannel(p.channel);
+    }
+    if (!c) {
+        if (now - m_restoreSince < 5000)
+            return;  // the server may still be arriving
+        c = m_client.findChannel(p.ret ? p.ret : p.parent);
+    }
+    m_restorePending = false;
+    if (!c)
+        return;
+
+    int guild_index = 0;
+    if (c->guild_id) {
+        guild_index = -1;
+        auto &guilds = m_client.guilds();
+        for (size_t i = 0; i < guilds.size(); i++)
+            if (guilds[i].id == c->guild_id)
+                guild_index = (int)i + 1;
+        if (guild_index < 0)
+            return;
+    }
+    m_guildIndex = guild_index;
+    rebuildRows();
+    // Highlight its row: the channel itself, else the channel or forum it's in.
+    for (Snowflake want : {c->id, c->isThread() ? c->parent_id : 0, p.ret}) {
+        bool found = false;
+        for (size_t i = 0; want && i < m_rows.size(); i++)
+            if (m_rows[i].id == want && m_rows[i].selectable()) {
+                m_channelIndex = (int)i;
+                found = true;
+                break;
+            }
+        if (found)
+            break;
+    }
+    Snowflake id = c->id;
+    openChannel(id);
+    if (!m_openChannel && !m_openForum)
+        return;
+    if (m_openChannel == id && p.ret && c->id == p.channel && !m_openForum && m_client.findChannel(p.ret))
+        m_threadReturn = p.ret;
+    if (m_openForum)
+        m_client.loadForum(m_openForum);  // for B back to the posts
+    m_pane = Pane::Messages;
+    m_channelsEntered = true;
+    logf("app: reopened the last channel");
+}
+
+void App::refreshAfterReconnect()
+{
+    // READY starts the client's state over (messages, subscriptions, threads
+    // it didn't list), and a resume may have skipped events: refetch what's shown.
+    if (m_openChannel) {
+        if (!m_client.findChannel(m_openChannel) && m_place.channel == m_openChannel && m_place.parent)
+            m_client.ensureThread(m_place.channel, m_place.parent, m_place.guild, m_place.name);
+        m_client.focusChannel(m_openChannel);
+        m_client.reloadMessages(m_openChannel, true);
+        m_layoutVersion = ~0u;
+        logf("app: reconnected, refreshing the open channel");
+    } else if (inForum()) {
+        m_client.focusChannel(m_openForum);
+        m_client.reloadForum(m_openForum);
+        logf("app: reconnected, refreshing the open forum");
+    }
+}
+
 void App::exit()
 {
+    appletUnhook(&m_appletHook);
     closeVideo();
     m_client.stop();
 #if defined(__SWITCH2__)
@@ -237,9 +378,18 @@ void App::startClient()
     m_guildIndex = 0;
     m_channelIndex = 0;
     m_openChannel = 0;
+    m_openForum = 0;
+    m_threadReturn = 0;
     m_rowsVersion = ~0u;
     m_layoutVersion = ~0u;
+    m_restorePending = true;
+    m_restoreSince = 0;
+    m_statusMenuOpen = false;
     m_client.start(m_token);
+    // What the user had last time: the status and the mute/deafen buttons.
+    m_client.setPresence(m_settings.status, false);
+    m_client.setVoiceMuted(m_settings.self_mute);
+    m_client.setVoiceDeafened(m_settings.self_deaf);
 }
 
 bool App::promptText(const char *header, const char *guide, std::string &out, Kbd kind,
@@ -257,6 +407,12 @@ bool App::promptText(const char *header, const char *guide, std::string &out, Kb
     swkbdConfigSetInitialText(&kbd, out.c_str());
     switch (kind) {
     case Kbd::Message:
+        // The keyboard with word predictions above the keys: the normal type
+        // (the console's own input languages, not QWERTY only) with the
+        // dictionary on. Messages are longer than 32 characters, so it is
+        // always the multi-line box (the one-line layout only exists up to 32).
+        swkbdConfigSetType(&kbd, SwkbdType_Normal);
+        swkbdConfigSetDicFlag(&kbd, 1);
         swkbdConfigSetStringLenMax(&kbd, max_len ? max_len : 2000);
         swkbdConfigSetReturnButtonFlag(&kbd, 1);  // allow newlines
         swkbdConfigSetTextDrawType(&kbd, SwkbdTextDrawType_Box);
@@ -277,6 +433,7 @@ bool App::promptText(const char *header, const char *guide, std::string &out, Kb
     std::vector<char> buf(8192, 0);
     Result rc = swkbdShow(&kbd, buf.data(), buf.size());
     swkbdClose(&kbd);
+    m_frameTime = nowMs();  // time typing isn't a sleep (frame() checks the gap)
     if (R_FAILED(rc)) {
         memset(buf.data(), 0, buf.size());
         return false;
@@ -609,8 +766,8 @@ void App::openComposeMenu()
 void App::drawChip(Rect r, const MessageLayout::Chip &c, bool focus)
 {
     const Color tint(col::accent.r, col::accent.g, col::accent.b, 60);
-    if (c.reaction.me || focus) {
-        m_r.fillRoundRect(r, 8, focus ? col::bright : col::accent);
+    if (c.reaction.me) {
+        m_r.fillRoundRect(r, 8, col::accent);
         m_r.fillRoundRect({r.x + 1.5f, r.y + 1.5f, r.w - 3, r.h - 3}, 7, col::bg_messages);
     }
     m_r.fillRoundRect({r.x + 1.5f, r.y + 1.5f, r.w - 3, r.h - 3}, 7,
@@ -972,10 +1129,10 @@ void App::drawEmojiPicker()
         if (r.y + r.h < g.y || r.y > g.y + g.h)
             continue;
         bool focus = !m_mouseMode && (int)k == m_emojiIndex;
-        if (focus || hovering(r))
+        if (hovering(r))
             m_r.fillRoundRect(r, 6, col::selected);
         if (focus)
-            drawFocusRing({r.x + 1, r.y + 1, r.w - 2, r.h - 2});
+            drawFocusRing({r.x + 4, r.y + 4, r.w - 8, r.h - 8}, 4);
         const EmojiItem &it = m_emojiSections[cell.section].items[cell.item];
         if (GLuint tex = m_images.get(it.image))
             m_r.drawImage(tex, {r.x + 6, r.y + 6, r.w - 12, r.h - 12}, Shape::Rect);
@@ -1028,21 +1185,257 @@ bool App::partFocused(size_t li, PartKind kind, size_t index) const
            m_selPart == Part{kind, index};
 }
 
+// Left/right within one row of spots (sorted by x): the index to go to, or -1.
+int App::stepInRow(const std::vector<NavSpot> &spots, size_t at, int dir)
+{
+    int best = -1;
+    for (size_t i = 0; i < spots.size(); i++) {
+        if (i == at || spots[i].row != spots[at].row)
+            continue;
+        float d = (spots[i].x - spots[at].x) * dir;
+        if (d > 0 && (best < 0 || d < (spots[best].x - spots[at].x) * dir))
+            best = (int)i;
+    }
+    return best;
+}
+
+// The spot in a row nearest to column x, or -1 if the row is empty.
+int App::nearestInRow(const std::vector<NavSpot> &spots, int row, float x)
+{
+    int best = -1;
+    for (size_t i = 0; i < spots.size(); i++)
+        if (spots[i].row == row && (best < 0 || std::abs(spots[i].x - x) < std::abs(spots[best].x - x)))
+            best = (int)i;
+    return best;
+}
+
+std::vector<App::NavSpot> App::messageSpots(size_t li) const
+{
+    std::vector<NavSpot> spots;
+    if (li >= m_layout.size())
+        return spots;
+    const MessageLayout &L = m_layout[li];
+    const float vx = kGuildBarW + kChannelW, vw = Renderer::kWidth - vx, tx = vx + kMsgTextX;
+    auto add = [&](Part p, float x, int row) {
+        NavSpot n;
+        n.part = p;
+        n.x = x;
+        n.row = row;
+        spots.push_back(n);
+    };
+    // The top row: avatar, the message itself, Reply (top right).
+    if (L.show_header)
+        add({PartKind::Avatar}, vx + kMsgAvatarX, 0);
+    add({}, tx + 100, 0);
+    Channel *ch = m_openChannel ? const_cast<discord::Client &>(m_client).findChannel(m_openChannel) : nullptr;
+    if (L.can_reply && ch && const_cast<discord::Client &>(m_client).canSend(*ch))
+        add({PartKind::Reply}, vx + vw - 60, 0);
+    // Then pictures (one per row), the thread box and the reaction rows.
+    int row = 1;
+    for (size_t i = 0; i < L.images.size(); i++)
+        add({PartKind::Image, i}, tx + L.images[i].w / 2, row++);
+    if (L.thread_id)
+        add({PartKind::Thread}, tx + 150, row++);
+    if (L.id && !L.chips.empty()) {
+        int last = 0;
+        for (size_t i = 0; i < L.chips.size(); i++) {
+            add({PartKind::Reaction, i}, tx + L.chips[i].x + L.chips[i].w / 2, row + L.chips[i].row);
+            last = std::max(last, L.chips[i].row);
+        }
+        row += last + 1;
+    }
+    return spots;
+}
+
+std::vector<App::NavSpot> App::composeSpots()
+{
+    // Row 0: "Replying to" (its x); row 1: the text box row.
+    std::vector<NavSpot> spots;
+    for (ComposeItem item : composeItems()) {
+        NavSpot n;
+        n.item = item;
+        n.row = 1;
+        Rect r{};
+        switch (item) {
+        case ComposeItem::CancelReply: r = cancelReplyRect(); n.row = 0; break;
+        case ComposeItem::Attach: r = attachButtonRect(); break;
+        case ComposeItem::RemoveImage: r = removeImageRect(); break;
+        case ComposeItem::Emoji: r = emojiButtonRect(); break;
+        case ComposeItem::Send: r = sendButtonRect(); break;
+        case ComposeItem::Text: {
+            // Where the typed text starts, a little in.
+            Draft *d = currentDraft();
+            Rect a = d && d->has_image ? removeImageRect() : attachButtonRect();
+            r = {a.x + a.w + 10, 0, 200, 0};
+            break;
+        }
+        }
+        n.x = r.x + r.w / 2;
+        spots.push_back(n);
+    }
+    return spots;
+}
+
+App::NavKey App::navKey() const
+{
+    NavKey k;
+    k.compose = m_composeFocus;
+    k.item = m_composeSel;
+    int sel = selectedIndex();
+    k.message = sel >= 0 ? m_layout[sel].id : 0;
+    k.part = m_selPart;
+    return k;
+}
+
+float App::focusX()
+{
+    if (m_composeFocus) {
+        for (const auto &n : composeSpots())
+            if (n.item == m_composeSel)
+                return n.x;
+    } else if (int sel = selectedIndex(); sel >= 0) {
+        for (const auto &n : messageSpots((size_t)sel))
+            if (n.part == m_selPart)
+                return n.x;
+    }
+    // Nothing focused: the start of the text box.
+    for (const auto &n : composeSpots())
+        if (n.item == ComposeItem::Text)
+            return n.x;
+    return kGuildBarW + kChannelW + kMsgTextX + 100;
+}
+
+int App::newestVisibleMessage() const
+{
+    if (m_layout.empty())
+        return -1;
+    int i = (int)m_layout.size() - 1;
+    float bottom_from_end = m_msgScroll + 12;  // layout px below the view's bottom
+    float end = m_layoutHeight;
+    while (i > 0 && end - (m_layout[i].top + m_layout[i].height) < bottom_from_end - 1)
+        i--;
+    return i;
+}
+
+void App::selectMessageAt(int i, Part part)
+{
+    m_composeFocus = false;
+    m_selActive = true;
+    m_selId = m_layout[i].id;
+    m_selHint = (size_t)i;
+    m_selPart = part;
+    m_selScrollPending = true;
+}
+
+void App::moveSpatial(int dir)
+{
+    if (!m_navValid || !(m_navAt == navKey()))
+        m_navX = focusX();
+    // Lands on the spot of `spots` in `row` nearest the column.
+    auto land = [&](const std::vector<NavSpot> &spots, int row, NavSpot &out) {
+        int i = nearestInRow(spots, row, m_navX);
+        if (i >= 0)
+            out = spots[i];
+        return i >= 0;
+    };
+    auto lastRow = [](const std::vector<NavSpot> &spots) {
+        int r = 0;
+        for (const auto &n : spots)
+            r = std::max(r, n.row);
+        return r;
+    };
+    auto enterMessage = [&](int li, bool from_below) {
+        auto spots = messageSpots((size_t)li);
+        NavSpot n;
+        if (land(spots, from_below ? lastRow(spots) : 0, n))
+            selectMessageAt(li, n.part);
+        else
+            selectMessageAt(li, {});
+    };
+    auto enterCompose = [&](int row) {
+        auto spots = composeSpots();
+        NavSpot n;
+        bool has_row0 = false;
+        for (const auto &c : spots)
+            has_row0 |= c.row == 0;
+        if (row == 0 && !has_row0)
+            row = 1;
+        if (!land(spots, row, n))
+            return false;
+        if (m_selActive)
+            clearMessageSelection();
+        m_composeFocus = true;
+        m_composeSel = n.item;
+        return true;
+    };
+
+    if (m_composeFocus) {
+        int row = 1;
+        for (const auto &c : composeSpots())
+            if (c.item == m_composeSel)
+                row = c.row;
+        bool has_row0 = false;
+        for (const auto &c : composeSpots())
+            has_row0 |= c.row == 0;
+        if (dir > 0) {
+            if (row == 0)
+                enterCompose(1);
+        } else if (row == 1 && has_row0) {
+            enterCompose(0);  // up to "Replying to"
+        } else if (int li = newestVisibleMessage(); li >= 0) {
+            enterMessage(li, true);
+        }
+    } else if (int sel = selectedIndex(); sel < 0) {
+        // Following the newest messages: up picks the newest on screen,
+        // down goes to the text box.
+        if (dir < 0) {
+            if (int li = newestVisibleMessage(); li >= 0)
+                enterMessage(li, true);
+        } else {
+            enterCompose(0);
+        }
+    } else {
+        auto spots = messageSpots((size_t)sel);
+        int row = 0;
+        for (const auto &n : spots)
+            if (n.part == m_selPart)
+                row = n.row;
+        NavSpot n;
+        if (row + dir >= 0 && row + dir <= lastRow(spots) && land(spots, row + dir, n)) {
+            m_selPart = n.part;
+            m_selScrollPending = true;
+        } else if (dir < 0) {
+            if (sel > 0)
+                enterMessage(sel - 1, true);
+        } else if (sel + 1 < (int)m_layout.size()) {
+            enterMessage(sel + 1, false);
+        } else if (!enterCompose(0)) {
+            clearMessageSelection();  // back to following the newest
+        }
+    }
+    m_navAt = navKey();
+    m_navValid = true;
+}
+
 bool App::stepPart(int dir)
 {
     int sel = selectedIndex();
     if (sel < 0)
         return false;
-    auto parts = messageParts((size_t)sel);
-    int at = -1;  // the message itself
-    for (size_t i = 0; i < parts.size(); i++)
-        if (parts[i] == m_selPart)
-            at = (int)i;
-    int to = at + dir;
-    if (to < -1 || to >= (int)parts.size())
-        return false;
-    m_selPart = to < 0 ? Part{} : parts[to];
-    return true;
+    auto spots = messageSpots((size_t)sel);
+    for (size_t i = 0; i < spots.size(); i++) {
+        if (!(spots[i].part == m_selPart))
+            continue;
+        int to = stepInRow(spots, i, dir);
+        if (to < 0)
+            return false;
+        m_selPart = spots[to].part;
+        m_navX = spots[to].x;
+        m_navAt = navKey();
+        m_navValid = true;
+        return true;
+    }
+    return false;
 }
 
 void App::activatePart()
@@ -1104,19 +1497,20 @@ bool App::composeFocused(ComposeItem item) const
 
 bool App::stepCompose(int dir)
 {
-    auto items = composeItems();
-    int at = -1;
-    for (size_t i = 0; i < items.size(); i++)
-        if (items[i] == m_composeSel)
-            at = (int)i;
-    if (at < 0) {
-        m_composeSel = ComposeItem::Text;
+    auto spots = composeSpots();
+    for (size_t i = 0; i < spots.size(); i++) {
+        if (spots[i].item != m_composeSel)
+            continue;
+        int to = stepInRow(spots, i, dir);
+        if (to < 0)
+            return false;
+        m_composeSel = spots[to].item;
+        m_navX = spots[to].x;
+        m_navAt = navKey();
+        m_navValid = true;
         return true;
     }
-    int to = at + dir;
-    if (to < 0 || to >= (int)items.size())
-        return false;
-    m_composeSel = items[to];
+    m_composeSel = ComposeItem::Text;
     return true;
 }
 
@@ -1141,14 +1535,29 @@ void App::composeActivate(ComposeItem item)
     }
 }
 
-void App::drawFocusRing(Rect r)
+void App::drawFocusCircle(float cx, float cy, float radius)
 {
-    const float t = 2, g = 3;
-    Rect o{r.x - g - t, r.y - g - t, r.w + 2 * (g + t), r.h + 2 * (g + t)};
-    m_r.fillRect({o.x, o.y, o.w, t}, col::bright);
-    m_r.fillRect({o.x, o.y + o.h - t, o.w, t}, col::bright);
-    m_r.fillRect({o.x, o.y, t, o.h}, col::bright);
-    m_r.fillRect({o.x + o.w - t, o.y, t, o.h}, col::bright);
+    drawFocusShape({cx - radius, cy - radius, radius * 2, radius * 2}, Shape::Circle);
+}
+
+void App::drawFocusRing(Rect r, float radius)
+{
+    drawFocusShape(r, Shape::Rounded, radius);
+}
+
+void App::drawFocusShape(Rect r, Shape shape, float radius)
+{
+    // Like the console's own cursor: an outline a few pixels outside the
+    // shape, following it exactly, in a cyan-to-blue gradient whose bright
+    // side travels round, gently pulsing.
+    const float gap = 2, thick = 3;
+    float secs = (float)(m_frameTime % 600000) / 1000.0f;
+    float phase = secs * 2.4f;                        // about one turn every 2.6 s
+    float pulse = 0.82f + 0.18f * sinf(secs * 4.2f);  // brightness, about 0.7 Hz
+    auto shade = [pulse](int r, int g, int b) {
+        return Color((uint8_t)(r * pulse), (uint8_t)(g * pulse), (uint8_t)(b * pulse));
+    };
+    m_r.drawOutline(r, shape, radius, gap, thick, shade(40, 236, 255), shade(70, 110, 255), phase);
 }
 
 // --- Profile card ------------------------------------------------------------
@@ -1205,7 +1614,15 @@ void App::drawProfile()
 
     // Banner: the picture, else the accent colour.
     Rect banner{c.x + 8, y + 8, c.w - 16, (c.w - 16) / 2.5f};
-    GLuint btex = p && !p->banner.empty() ? m_images.get(p->banner) : 0;
+    // Animated banners play (a_ hashes come as GIFs); the still one shows
+    // while the GIF loads.
+    GLuint btex = 0;
+    if (p && !p->banner.empty()) {
+        std::string anim = discord::cdn::animatedPath(p->banner);
+        btex = m_images.get(anim);
+        if (!btex && anim != p->banner)
+            btex = m_images.get(p->banner);
+    }
     if (!p || p->banner.empty() || !btex)
         banner.h = 110;
     if (btex) {
@@ -1224,10 +1641,24 @@ void App::drawProfile()
     std::string big = m_profile.avatar;
     if (size_t q = big.find("?size="); q != std::string::npos)
         big = big.substr(0, q) + "?size=128";
-    if (m_images.get(big))
+    std::string anim = discord::cdn::animatedPath(big);  // GIF avatars play here
+    if (anim != big && m_images.get(anim))
+        drawAvatar(acx, acy, ar, m_profile.name, m_profile.id, anim);
+    else if (m_images.get(big))
         drawAvatar(acx, acy, ar, m_profile.name, m_profile.id, big);
     else
         drawAvatar(acx, acy, ar, m_profile.name, m_profile.id, m_profile.avatar);
+
+    // Their status on the avatar's corner, as on Discord.
+    const bool is_me = m_profile.id == m_client.me().id;
+    const discord::Presence *presence =
+        m_profile.webhook || is_me ? nullptr : m_client.presenceOf(m_profile.id, m_profile.guild, p);
+    std::string status = is_me ? m_client.presence() : presence ? presence->status : std::string();
+    if (!status.empty()) {
+        float sx = acx + ar * 0.72f, sy = acy + ar * 0.72f, sr = 9;
+        m_r.fillShape({sx - sr - 5, sy - sr - 5, (sr + 5) * 2, (sr + 5) * 2}, Shape::Circle, card);
+        drawStatusDot(sx, sy, sr, status, card);
+    }
 
     // Badges, right of the avatar.
     if (p && !p->badges.empty()) {
@@ -1277,6 +1708,14 @@ void App::drawProfile()
     if (!sub.empty()) {
         m_r.drawText(c.x + pad, y, m_r.ellipsize(sub, 15, inner), 15, col::muted);
         y += 24;
+    }
+    // Their custom status, wrapped to the card's width.
+    if (presence && !presence->custom.empty()) {
+        for (const auto &line : m_r.wrapText(presence->custom, 14, inner)) {
+            m_r.drawText(c.x + pad, y, line, 14, col::text);
+            y += m_r.lineHeight(14);
+        }
+        y += 4;
     }
     y += 10;
 
@@ -1485,8 +1924,11 @@ void App::drawComposeMenu()
         ComposeAction a = actions[i];
         bool focus = m_mouseMode ? hovering(it) : (int)i == m_composeMenuIndex;
         bool danger = a == ComposeAction::Remove || a == ComposeAction::CancelReply;
-        if (focus)
+        bool filled = focus && m_mouseMode;  // the controller's focus is the outline
+        if (filled)
             m_r.fillRoundRect(it, 6, danger ? col::danger : col::accent);
+        else if (focus)
+            drawFocusRing({it.x + 5, it.y + 5, it.w - 10, it.h - 10}, 6);
         std::string label;
         switch (a) {
         case ComposeAction::Write: label = d && !d->text.empty() ? "Edit message" : "Write a message"; break;
@@ -1499,7 +1941,7 @@ void App::drawComposeMenu()
         case ComposeAction::Remove: label = d && d->has_image && d->image.video ? "Remove video" : "Remove picture"; break;
         case ComposeAction::CancelReply: label = "Cancel reply"; break;
         }
-        Color fg = focus ? col::on_accent : danger ? col::danger : col::text;
+        Color fg = filled ? col::on_accent : danger ? col::danger : col::text;
         m_r.drawText(it.x + 14, it.y + 12, m_r.ellipsize(label, 16, it.w - 28), 16, fg);
     }
 }
@@ -1560,11 +2002,11 @@ Rect App::pickerGridArea() const
 Rect App::pickerCellRect(int index) const
 {
     Rect g = pickerGridArea();
-    const float gap = 12;
-    float w = (g.w - gap * (kPickerCols - 1)) / kPickerCols, h = w * 9 / 16;
+    const float gap = 12, pad = kFocusPad;  // room for the focus outline at the edges
+    float w = (g.w - 2 * pad - gap * (kPickerCols - 1)) / kPickerCols, h = w * 9 / 16;
     float row_h = h + 30;
     int row = index / kPickerCols, col_i = index % kPickerCols;
-    return {g.x + col_i * (w + gap), g.y + row * row_h - m_pickerScroll, w, h};
+    return {g.x + pad + col_i * (w + gap), g.y + pad + row * row_h - m_pickerScroll, w, h};
 }
 
 int App::hitPicker(float x, float y) const
@@ -1660,14 +2102,15 @@ void App::drawPicker()
         Rect first = pickerCellRect(0);
         float row_h = first.h + 30;
         int rows = ((int)items.size() + kPickerCols - 1) / kPickerCols;
-        float max_scroll = std::max(0.0f, rows * row_h - g.h);
+        float max_scroll = std::max(0.0f, kFocusPad + rows * row_h - g.h);
         if (m_pickerScrollPending) {
             m_pickerScrollPending = false;
+            // The row's top, less the padding above it (its outline fits in that).
             float top = (m_pickerIndex / kPickerCols) * row_h;
             if (top < m_pickerScroll)
                 m_pickerScroll = top;
-            if (top + row_h > m_pickerScroll + g.h)
-                m_pickerScroll = top + row_h - g.h;
+            if (kFocusPad + top + row_h > m_pickerScroll + g.h)
+                m_pickerScroll = kFocusPad + top + row_h - g.h;
             m_pickerScroll = std::clamp(m_pickerScroll, 0.0f, max_scroll);
             m_pickerScroller.stop();
         }
@@ -1681,7 +2124,7 @@ void App::drawPicker()
             if (r.y > g.y + g.h)
                 break;
             bool focus = m_mouseMode ? hovering(r) : (int)i == m_pickerIndex;
-            if (focus)
+            if (focus && m_mouseMode)
                 m_r.fillRoundRect({r.x - 4, r.y - 4, r.w + 8, r.h + 8}, 9, col::accent);
             bool failed = false;
             if (GLuint tex = m_images.get(items[i].key, &failed))
@@ -1704,6 +2147,8 @@ void App::drawPicker()
                     m_r.drawText(r.x + r.w - mw - 8, r.y + r.h - 21, mb, 12, Color(255, 255, 255));
                 }
             }
+            if (focus && !m_mouseMode)
+                drawFocusRing(r, 6);
             std::string label = m_r.ellipsize(items[i].label(), 13, r.w - 4);
             m_r.drawText(r.x + 2, r.y + r.h + 7, label, 13, focus ? col::bright : col::muted);
         }
@@ -1834,14 +2279,16 @@ Snowflake App::currentGuildId() const
 
 void App::rebuildRows()
 {
-    uint32_t version = m_client.structureVersion();
-    if (version == m_rowsVersion && m_rowsGuild == m_guildIndex)
+    uint32_t version = m_client.structureVersion(), voice_version = m_client.voiceVersion();
+    if (version == m_rowsVersion && voice_version == m_rowsVoiceVersion && m_rowsGuild == m_guildIndex)
         return;
-    Snowflake selected_id = (m_channelIndex >= 0 && (size_t)m_channelIndex < m_rows.size())
-                                ? m_rows[m_channelIndex].id
-                                : 0;
+    Snowflake selected_id =
+        (m_channelIndex >= 0 && (size_t)m_channelIndex < m_rows.size() && m_rows[m_channelIndex].selectable())
+            ? m_rows[m_channelIndex].id
+            : 0;
     bool guild_changed = m_rowsGuild != m_guildIndex;
     m_rowsVersion = version;
+    m_rowsVoiceVersion = voice_version;
     m_rowsGuild = m_guildIndex;
     m_rows.clear();
 
@@ -1880,6 +2327,16 @@ void App::rebuildRows()
             ChannelRow row{c.id, c.name, false, voice};
             row.kind = voice ? "voice" : c.isForum() ? "forum" : "hash";
             m_rows.push_back(row);
+            if (voice) {
+                // Who is in it, beneath it.
+                for (const VoiceState *vs : g->voiceIn(c.id)) {
+                    ChannelRow mr{vs->user_id, "", false, false};
+                    mr.member = true;
+                    mr.indent = 1;
+                    m_rows.push_back(mr);
+                }
+                continue;
+            }
             if (c.isForum())
                 continue;
             auto it = threads.find(c.id);
@@ -1897,7 +2354,7 @@ void App::rebuildRows()
     m_channelIndex = -1;
     if (!guild_changed && selected_id) {
         for (size_t i = 0; i < m_rows.size(); i++)
-            if (m_rows[i].id == selected_id)
+            if (m_rows[i].id == selected_id && m_rows[i].selectable())
                 m_channelIndex = (int)i;
     }
     if (m_channelIndex < 0) {
@@ -1907,7 +2364,7 @@ void App::rebuildRows()
             m_channelShown = -1;
         }
         m_channelIndex = 0;
-        while ((size_t)m_channelIndex < m_rows.size() && m_rows[m_channelIndex].header)
+        while ((size_t)m_channelIndex < m_rows.size() && !m_rows[m_channelIndex].selectable())
             m_channelIndex++;
         if ((size_t)m_channelIndex >= m_rows.size())
             m_channelIndex = 0;
@@ -2068,9 +2525,9 @@ void App::drawForum(Rect area)
             continue;
         bool focus = !m_mouseMode && m_pane == Pane::Messages && (int)i == m_forumIndex;
         bool hover = hovering(card);
-        m_r.fillRoundRect(card, 8, focus || hover ? col::selected : col::bg_panel);
+        m_r.fillRoundRect(card, 8, hover ? col::selected : col::bg_panel);
         if (focus)
-            drawFocusRing(card);
+            drawFocusRing(card, 8);
         float top = std::max(card.y, view.y), bottom = std::min(card.y + card.h, view.y + view.h);
         m_forumHits.push_back({{card.x, top, card.w, bottom - top}, i});
 
@@ -2188,59 +2645,68 @@ void App::moveSelection(int delta)
         int count = (int)m_client.guilds().size() + 1;
         m_guildIndex = std::clamp(m_guildIndex + delta, 0, count - 1);
     } else if (m_pane == Pane::Channels) {
-        // Below the last channel: the settings gear.
-        if (m_gearFocus) {
+        // Below the last channel: Disconnect (in a call), then the user
+        // panel's buttons.
+        PanelFocus below = m_client.inVoice() ? PanelFocus::Disconnect : PanelFocus::Status;
+        if (panelFocused()) {
             if (delta < 0)
-                m_gearFocus = false;
+                m_panelFocus = m_panelFocus != PanelFocus::Disconnect && m_client.inVoice() ? PanelFocus::Disconnect
+                                                                                           : PanelFocus::None;
+            else if (m_panelFocus == PanelFocus::Disconnect)
+                m_panelFocus = PanelFocus::Status;
             return;
         }
-        if (m_rows.empty()) {
-            m_gearFocus = delta > 0;
+        if (!m_channelsEntered) {
+            // On the list as a whole: down goes straight to the buttons.
+            if (delta > 0)
+                m_panelFocus = below;
             return;
         }
+        if (m_rows.empty())
+            return;
         int i = m_channelIndex;
         int step = delta > 0 ? 1 : -1;
         for (int n = 0; n < std::abs(delta); n++) {
             int j = i + step;
-            while (j >= 0 && (size_t)j < m_rows.size() && m_rows[j].header)
+            while (j >= 0 && (size_t)j < m_rows.size() && !m_rows[j].selectable())
                 j += step;
-            if (j < 0 || (size_t)j >= m_rows.size()) {
-                if (j >= 0 && i == m_channelIndex && n == 0)
-                    m_gearFocus = true;
-                break;
-            }
+            if (j < 0 || (size_t)j >= m_rows.size())
+                break;  // the ends of the list stop the highlight
             i = j;
         }
         m_channelIndex = i;
     } else if (inForum()) {
         m_forumIndex = std::clamp(m_forumIndex + delta, 0, std::max(0, (int)m_forumPosts.size() - 1));
         m_forumScrollPending = true;
-    } else if (m_composeFocus) {
-        // Up from the text box row goes back to the newest message.
-        if (delta < 0)
-            moveMessageSelection(-1);
-    } else if (delta > 0 && selectedIndex() < 0) {
-        // Down past the newest message: the text box row.
-        if (!composeItems().empty()) {
-            m_composeFocus = true;
-            m_composeSel = ComposeItem::Text;
-        }
     } else {
-        moveMessageSelection(delta);
+        moveSpatial(delta > 0 ? 1 : -1);
     }
 }
 
 void App::activate()
 {
     if (m_pane == Pane::Guilds) {
+        // (A) on a server goes straight into its channel list.
         m_pane = Pane::Channels;
+        m_channelsEntered = true;
+        m_panelFocus = PanelFocus::None;
         rebuildRows();
     } else if (m_pane == Pane::Channels) {
-        if (m_gearFocus) {
-            openSettings();
+        if (panelFocused()) {
+            activatePanel(m_panelFocus);
+        } else if (!m_channelsEntered) {
+            m_channelsEntered = true;  // into the list: up/down pick a channel
         } else if (m_channelIndex >= 0 && (size_t)m_channelIndex < m_rows.size()) {
             const ChannelRow &row = m_rows[m_channelIndex];
-            if (!row.header && !row.voice) {
+            if (row.voice) {
+                Channel *c = m_client.findChannel(row.id);
+                if (m_client.voiceCall().channel_id == row.id)
+                    ;  // already there
+                else if (c && m_client.canJoinVoice(*c))
+                    m_client.joinVoice(row.id);
+                else
+                    toast("You can't join this voice channel.", false);
+            } else if (row.selectable()) {
                 openChannel(row.id);
                 m_pane = Pane::Messages;
             }
@@ -2286,7 +2752,13 @@ void App::back()
     }
     m_composeFocus = false;
     m_selPart = {};
-    m_gearFocus = false;
+    if (m_pane == Pane::Channels && (panelFocused() || m_channelsEntered)) {
+        // Out of the list (or off a button) back to the list as a whole.
+        m_panelFocus = PanelFocus::None;
+        m_channelsEntered = false;
+        return;
+    }
+    m_panelFocus = PanelFocus::None;
     if (m_pane == Pane::Messages && m_openChannel && (m_openForum || m_threadReturn)) {
         // From a thread back to its forum's posts or the channel it was opened from.
         Snowflake forum = m_openForum, ret = m_threadReturn;
@@ -2297,10 +2769,12 @@ void App::back()
             openChannel(ret);
         return;
     }
-    if (m_pane == Pane::Messages)
+    if (m_pane == Pane::Messages) {
         m_pane = Pane::Channels;
-    else if (m_pane == Pane::Channels)
+        m_channelsEntered = false;
+    } else if (m_pane == Pane::Channels) {
         m_pane = Pane::Guilds;
+    }
 }
 
 // --- Pointer input (touch and mouse) ----------------------------------------
@@ -2323,13 +2797,13 @@ int App::hitChannelRow(float x, float y) const
 {
     if (m_screen != Screen::Main || x < kGuildBarW || x >= kGuildBarW + kChannelW)
         return -1;
-    if (y < kHeaderH || y > Renderer::kHeight - kUserPanelH)
+    if (y < kHeaderH || y > Renderer::kHeight - bottomPanelH())
         return -1;
     float local = y - kHeaderH - 8 + m_channelScroll;
     if (local < 0)
         return -1;
     int index = (int)(local / kRowH);
-    if ((size_t)index >= m_rows.size() || m_rows[index].header)
+    if ((size_t)index >= m_rows.size() || !m_rows[index].selectable())
         return -1;
     return index;
 }
@@ -2419,6 +2893,13 @@ void App::tapAt(float x, float y)
             m_profileOpen = false;
         return;
     }
+    if (m_statusMenuOpen) {
+        m_statusMenuOpen = false;
+        for (int i = 0; i < 4; i++)
+            if (statusMenuItemRect(i).contains(x, y))
+                chooseStatus(i);
+        return;
+    }
     if (m_composeMenuOpen) {
         auto actions = composeActions();
         Rect r = composeMenuRect(actions.size());
@@ -2431,6 +2912,12 @@ void App::tapAt(float x, float y)
         return;
     }
     if (m_screen == Screen::Main && m_openChannel) {
+        if (hasMessagesBack() && messagesBackRect().contains(x, y)) {
+            // Out of a forum post (or thread) to where it was opened from.
+            m_pane = Pane::Messages;
+            back();
+            return;
+        }
         if (replying() && cancelReplyRect().contains(x, y)) {
             if (Draft *d = currentDraft())
                 d->reply_to = 0;
@@ -2492,15 +2979,21 @@ void App::tapAt(float x, float y)
         }
         return;
     }
-    if (settingsGearRect().contains(x, y)) {
-        openSettings();
-        return;
+    for (PanelFocus f : {PanelFocus::Disconnect, PanelFocus::Mute, PanelFocus::Deafen, PanelFocus::Gear,
+                         PanelFocus::Status}) {
+        if (f == PanelFocus::Disconnect && !m_client.inVoice())
+            continue;
+        if (panelButtonRect(f).contains(x, y)) {
+            activatePanel(f);
+            return;
+        }
     }
     if (x < kGuildBarW) {
         int index = hitGuild(x, y);
         if (index >= 0) {
             m_guildIndex = index;
             m_pane = Pane::Channels;
+            m_channelsEntered = false;
             rebuildRows();
         }
     } else if (x < kGuildBarW + kChannelW) {
@@ -2508,6 +3001,8 @@ void App::tapAt(float x, float y)
         if (index >= 0) {
             m_channelIndex = index;
             m_pane = Pane::Channels;
+            m_panelFocus = PanelFocus::None;
+            m_channelsEntered = true;
             activate();
         }
     } else {
@@ -2837,6 +3332,10 @@ void App::handleInput()
         }
         return;
     }
+    if (m_statusMenuOpen) {
+        handleStatusMenuInput(down);
+        return;
+    }
     if (m_composeMenuOpen) {
         handleComposeMenuInput(down);
         return;
@@ -2856,8 +3355,15 @@ void App::handleInput()
         openSettings();
         return;
     }
-    if (m_pane != Pane::Channels)
-        m_gearFocus = false;
+    if (m_pane != Pane::Channels) {
+        m_panelFocus = PanelFocus::None;
+        m_channelsEntered = false;
+    }
+    if (m_pane == Pane::Channels && m_panelFocus == PanelFocus::Disconnect && !m_client.inVoice())
+        m_panelFocus = PanelFocus::Status;
+    // Left stick click: mute or unmute, from anywhere.
+    if (down & HidNpadButton_StickL)
+        activatePanel(PanelFocus::Mute);
     if (m_pane != Pane::Messages)
         m_composeFocus = false;
 
@@ -2885,9 +3391,17 @@ void App::handleInput()
     const u64 right = HidNpadButton_Right | HidNpadButton_StickLRight;
     const u64 left = HidNpadButton_Left | HidNpadButton_StickLLeft;
     if (down & right) {
-        if (m_pane == Pane::Guilds)
+        if (m_pane == Pane::Guilds) {
             activate();
-        else if (m_pane == Pane::Channels && (m_openChannel || inForum()) && !m_gearFocus)
+            m_channelsEntered = false;  // Right stops at the channel list as a whole
+        } else if (m_pane == Pane::Channels && panelFocused()) {
+            if (m_panelFocus == PanelFocus::Status)
+                m_panelFocus = PanelFocus::Mute;
+            else if (m_panelFocus == PanelFocus::Mute)
+                m_panelFocus = PanelFocus::Deafen;
+            else if (m_panelFocus == PanelFocus::Deafen)
+                m_panelFocus = PanelFocus::Gear;
+        } else if (m_pane == Pane::Channels && (m_openChannel || inForum()))
             m_pane = Pane::Messages;
         else if (m_pane == Pane::Messages && m_composeFocus)
             stepCompose(1);
@@ -2896,7 +3410,19 @@ void App::handleInput()
     }
     if (down & left) {
         bool moved = false;
-        if (m_pane == Pane::Messages && m_composeFocus)
+        if (m_pane == Pane::Channels && (m_panelFocus == PanelFocus::Mute || m_panelFocus == PanelFocus::Deafen ||
+                                         m_panelFocus == PanelFocus::Gear)) {
+            m_panelFocus = m_panelFocus == PanelFocus::Gear     ? PanelFocus::Deafen
+                           : m_panelFocus == PanelFocus::Deafen ? PanelFocus::Mute
+                                                                : PanelFocus::Status;
+            moved = true;
+        } else if (m_pane == Pane::Channels && (m_channelsEntered || panelFocused())) {
+            // Left of the channel column: the server list.
+            m_panelFocus = PanelFocus::None;
+            m_channelsEntered = false;
+            m_pane = Pane::Guilds;
+            moved = true;
+        } else if (m_pane == Pane::Messages && m_composeFocus)
             moved = stepCompose(-1);
         else if (m_pane == Pane::Messages && selectedIndex() >= 0)
             moved = stepPart(-1);
@@ -2957,10 +3483,27 @@ bool App::frame()
 {
     {
         uint64_t now = nowMs();
+        // Back from sleep (the hook, or a long gap between frames): the
+        // gateway socket is stale, so reconnect now instead of waiting for
+        // the heartbeat to notice.
+        if (m_woke || (m_frameTime && now - m_frameTime > 15000)) {
+            logf("app: resumed after %llu ms", (unsigned long long)(m_frameTime ? now - m_frameTime : 0));
+            m_client.reconnectNow();
+        }
+        m_woke = false;
         m_frameDt = m_frameTime ? std::clamp((now - m_frameTime) / 1000.0f, 0.0f, 0.1f) : 1 / 60.0f;
         m_frameTime = now;
     }
     m_client.update();
+    if (uint32_t n = m_client.connectionCount(); n != m_seenConnections) {
+        bool first = m_seenConnections == 0;
+        m_seenConnections = n;
+        if (!first && !m_restorePending)
+            refreshAfterReconnect();
+    }
+    if (m_restorePending && m_client.ready())
+        restorePlace();
+    trackPlace();
     m_auth.update();
     {
         std::string msg;
@@ -3023,20 +3566,19 @@ void App::drawLogin()
         Rect r = it.rect;
         if (it.field) {
             m_r.drawText(r.x, r.y - 20, it.label, 12, col::muted);
-            if (focused)
-                m_r.fillRoundRect({r.x - 2, r.y - 2, r.w + 4, r.h + 4}, 6, col::accent);
             m_r.fillRoundRect(r, 4, hover ? col::hover : col::bg_guilds);
+            if (focused)
+                drawFocusRing(r, 4);
             std::string value = it.value.empty() ? "Press (A) to type" : it.value;
             value = m_r.ellipsize(value, kTextSize, r.w - 28);
             m_r.drawText(r.x + 14, r.y + r.h / 2 - 11, value, kTextSize, it.value.empty() ? col::faint : col::text);
         } else {
-            Color bg = it.primary ? (hover || focused ? col::accent_hover : col::accent)
-                                  : (hover || focused ? col::selected : col::bg_input);
+            Color bg = it.primary ? (hover ? col::accent_hover : col::accent) : (hover ? col::selected : col::bg_input);
             if (!it.enabled)
                 bg = Color(bg.r, bg.g, bg.b, 110);
-            if (focused && it.primary)
-                m_r.fillRoundRect({r.x - 2, r.y - 2, r.w + 4, r.h + 4}, 6, col::bright);
             m_r.fillRoundRect(r, 4, bg);
+            if (focused)
+                drawFocusRing(r, 4);
             m_r.drawText(r.x + r.w / 2 - m_r.measureText(it.label, 17) / 2, r.y + r.h / 2 - 11, it.label, 17,
                          !it.enabled ? col::muted : it.primary ? col::on_accent : col::text);
         }
@@ -3160,7 +3702,9 @@ void App::drawMain()
     m_guildIndex = std::clamp(m_guildIndex, 0, (int)m_client.guilds().size());
     rebuildRows();
     drawGuildBar({0, 0, kGuildBarW, H});
-    drawChannelList({kGuildBarW, 0, kChannelW, H - kUserPanelH});
+    drawChannelList({kGuildBarW, 0, kChannelW, H - bottomPanelH()});
+    if (m_client.inVoice())
+        drawVoicePanel({kGuildBarW, H - kUserPanelH - kVoicePanelH, kChannelW, kVoicePanelH});
     drawUserPanel({kGuildBarW, H - kUserPanelH, kChannelW, kUserPanelH});
     drawMessages({kGuildBarW + kChannelW, 0, W - kGuildBarW - kChannelW, H - kHintsH});
     drawHints({kGuildBarW + kChannelW, H - kHintsH, W - kGuildBarW - kChannelW, kHintsH});
@@ -3184,6 +3728,8 @@ void App::drawMain()
     }
     if (m_composeMenuOpen)
         drawComposeMenu();
+    if (m_statusMenuOpen)
+        drawStatusMenu();
     if (m_emojiOpen)
         drawEmojiPicker();
     if (m_pickerOpen)
@@ -3275,6 +3821,8 @@ void App::drawGuildBar(Rect area)
     }
     m_guildScroller.update(m_guildScroll, 0, std::max(0.0f, 8 + count * item - area.h + 16), area.h, m_frameDt);
 
+    Rect focus_icon{};
+    bool has_focus = false;
     m_r.pushClip(area);
     for (int i = 0; i < count; i++) {
         float y = 8 + i * item - m_guildScroll;
@@ -3291,6 +3839,8 @@ void App::drawGuildBar(Rect area)
         }
         Color bg = is_sel ? col::accent : is_hover ? col::accent_hover : col::bg_input;
         Rect icon{cx - 24, cy - 24, 48, 48};
+        if (is_sel && m_pane == Pane::Guilds && !m_mouseMode)
+            focus_icon = icon, has_focus = true;  // outlined after the bar is drawn
         GLuint tex = i == 0 ? 0 : m_images.get(discord::cdn::guildIconPath(guilds[i - 1]));
         if (tex) {
             m_r.drawImage(tex, icon, Shape::Squircle);
@@ -3314,6 +3864,8 @@ void App::drawGuildBar(Rect area)
         if (i == 0)
             m_r.fillRect({area.x + 18, y + item + 1, area.w - 36, 2}, col::bg_input);
     }
+    if (has_focus)
+        drawFocusShape(focus_icon, Shape::Squircle);
     m_r.popClip();
 }
 
@@ -3345,6 +3897,10 @@ void App::drawChannelList(Rect area)
     float max_scroll = std::max(0.0f, 16 + m_rows.size() * kRowH - list.h);
     m_channelScroller.update(m_channelScroll, 0, max_scroll, list.h, m_frameDt);
 
+    std::set<Snowflake> speaking;
+    if (m_client.inVoice())
+        speaking = m_client.voiceSpeaking();
+    Guild *guild = m_guildIndex ? m_client.findGuild(currentGuildId()) : nullptr;
     m_r.pushClip(list);
     if (m_rows.empty()) {
         const char *empty = m_client.ready() ? "Nothing here yet." : "";
@@ -3365,38 +3921,54 @@ void App::drawChannelList(Rect area)
             m_r.drawText(list.x + 20, y + 13, m_r.ellipsize(upper, 12, list.w - 34), 12, col::faint);
             continue;
         }
+        if (row.member) {
+            if (guild)
+                drawVoiceMember(*guild, row.id, {list.x + 8, y + 1, list.w - 16, kRowH - 2}, speaking);
+            continue;
+        }
         bool is_sel = (int)i == m_channelIndex;
         bool is_open = row.id == m_openChannel || (m_openForum && row.id == m_openForum);
         Rect r{list.x + 8, y + 1, list.w - 16, kRowH - 2};
         bool is_hover = m_mouseMode && hitChannelRow(m_mouseX, m_mouseY) == (int)i;
         // In mouse mode the hover replaces the controller focus highlight.
-        if (is_sel && m_pane == Pane::Channels && !m_mouseMode && !m_gearFocus)
-            m_r.fillRoundRect(r, 4, col::selected);
-        else if (is_open)
+        if (is_open)
             m_r.fillRoundRect(r, 4, col::selected);
         else if (is_hover)
             m_r.fillRoundRect(r, 4, col::hover);
-        Color tc = row.voice ? col::faint
-                   : (is_open || is_hover || (is_sel && !m_mouseMode)) ? col::bright
-                                                                       : col::muted;
+        bool in_call = row.voice && m_client.voiceCall().channel_id == row.id;
+        bool sel_shown = is_sel && m_pane == Pane::Channels && !m_mouseMode && m_channelsEntered;
+        Color tc = (in_call || is_open || is_hover || sel_shown) ? col::bright : col::muted;
         float x = r.x + 10;
         if (m_guildIndex == 0) {
             drawAvatar(r.x + 16, r.y + r.h / 2, 12, row.label, row.id, row.icon);
             x = r.x + 36;
         } else if (row.kind) {
             float ix = r.x + 8 + row.indent * 18;
-            drawIcon(row.kind, {ix, r.y + r.h / 2 - 10, 20, 20}, row.voice ? col::faint : col::muted);
+            drawIcon(row.kind, {ix, r.y + r.h / 2 - 10, 20, 20}, in_call ? col::online : col::muted);
             x = ix + 26;
         }
-        Renderer::Bold b(m_r, is_open || (is_sel && m_pane == Pane::Channels && !m_mouseMode));
+        Renderer::Bold b(m_r, is_open || sel_shown);
         drawLabel(x, r.y + 7, row.label, 16, tc, r.x + r.w - x - 8);
+        if (sel_shown && !panelFocused())
+            drawFocusRing({r.x + 3, r.y + 3, r.w - 6, r.h - 6}, 4);
     }
     m_r.popClip();
+    // The list as a whole has the controller's focus: (A) goes into it.
+    if (m_pane == Pane::Channels && !m_mouseMode && !m_channelsEntered && !panelFocused())
+        drawFocusRing({area.x + 7, area.y + 7, area.w - 14, area.h - 14}, 8);
 }
 
 void App::drawUserPanel(Rect area)
 {
     m_r.fillRect(area, col::bg_panel);
+    // The avatar and name are a button: they open the status menu.
+    {
+        Rect b = panelButtonRect(PanelFocus::Status);
+        if (hovering(b) || m_statusMenuOpen)
+            m_r.fillRoundRect(b, 6, col::hover);
+        if (!m_mouseMode && m_pane == Pane::Channels && m_panelFocus == PanelFocus::Status && !m_statusMenuOpen)
+            drawFocusRing(b, 6);
+    }
     const User &me = m_client.me();
     std::string name = m_client.ready() ? me.displayName() : "...";
     drawAvatar(area.x + 28, area.y + area.h / 2, 16, name, me.id,
@@ -3404,7 +3976,7 @@ void App::drawUserPanel(Rect area)
     Color status_color = col::warn;
     std::string status = "Connecting";
     switch (m_client.status()) {
-    case discord::GatewayStatus::Connected: status_color = col::online; status = "Online"; break;
+    case discord::GatewayStatus::Connected: status = ""; break;  // our chosen status
     case discord::GatewayStatus::Reconnecting: status = "Reconnecting"; break;
     case discord::GatewayStatus::Fatal:
     case discord::GatewayStatus::AuthFailed: status_color = col::faint; status = "Disconnected"; break;
@@ -3412,25 +3984,290 @@ void App::drawUserPanel(Rect area)
     }
     // Status on the avatar's corner, like Discord.
     float sx = area.x + 40, sy = area.y + area.h / 2 + 11;
-    m_r.fillShape({sx - 7, sy - 7, 14, 14}, Shape::Circle, col::bg_panel);
-    m_r.fillShape({sx - 5, sy - 5, 10, 10}, Shape::Circle, status_color);
+    Color ring = hovering(panelButtonRect(PanelFocus::Status)) || m_statusMenuOpen ? col::hover : col::bg_panel;
+    m_r.fillShape({sx - 7, sy - 7, 14, 14}, Shape::Circle, ring);
+    if (status.empty()) {
+        static const char *const kLabels[] = {"Online", "Idle", "DND", "Invisible"};
+        const std::string &p = m_client.presence();
+        int i = p == "idle" ? 1 : p == "dnd" ? 2 : p == "invisible" ? 3 : 0;
+        status = kLabels[i];
+        drawStatusDot(sx, sy, 5, p, ring);
+    } else {
+        m_r.fillShape({sx - 5, sy - 5, 10, 10}, Shape::Circle, status_color);
+    }
     {
         Renderer::Bold b(m_r);
-        drawLabel(area.x + 54, area.y + 10, name, 15, col::bright, area.w - 64 - 44);
+        drawLabel(area.x + 54, area.y + 10, name, 15, col::bright, panelButtonRect(PanelFocus::Mute).x - area.x - 58);
     }
     m_r.drawText(area.x + 54, area.y + 30, status, 12, col::muted);
-    // Settings: a gear, with (-) shown for controllers.
-    Rect g = settingsGearRect();
-    bool g_focus = !m_mouseMode && m_pane == Pane::Channels && m_gearFocus;
-    if (hovering(g) || g_focus)
-        m_r.fillRoundRect(g, 6, col::hover);
-    if (g_focus)
-        drawFocusRing({g.x + 2, g.y + 2, g.w - 4, g.h - 4});
-    float gx = g.x + g.w / 2, gy = g.y + g.h / 2;
-    Color gc = hovering(g) || g_focus ? col::bright : col::muted;
-    drawIcon("gear", {gx - 11, gy - 11, 22, 22}, gc);
-    if (!m_mouseMode)
-        m_r.drawText(g.x - 24, gy - 8, "(-)", 12, col::faint);
+    // Mute, deafen and settings. Red when off, like Discord.
+    const discord::VoiceCall &call = m_client.voiceCall();
+    bool muted = call.muted || call.deafened || call.server_muted;
+    bool deafened = call.deafened || call.server_deafened;
+    drawPanelButton(PanelFocus::Mute, muted ? "mic-off" : "mic", muted);
+    drawPanelButton(PanelFocus::Deafen, deafened ? "headphone-off" : "headphones", deafened);
+    drawPanelButton(PanelFocus::Gear, "gear", false);
+}
+
+void App::drawPanelButton(PanelFocus f, const char *icon, bool off)
+{
+    Rect b = panelButtonRect(f);
+    bool focus = !m_mouseMode && m_pane == Pane::Channels && m_panelFocus == f;
+    if (hovering(b))
+        m_r.fillRoundRect(b, 6, col::hover);
+    if (focus)
+        drawFocusRing(b, 6);
+    Color c = off ? col::danger : hovering(b) || focus ? col::bright : col::muted;
+    drawIcon(icon, {b.x + b.w / 2 - 11, b.y + b.h / 2 - 11, 22, 22}, c);
+}
+
+void App::drawVoiceMember(const Guild &g, Snowflake user_id, Rect r, const std::set<Snowflake> &speaking)
+{
+    auto it = g.voice_states.find(user_id);
+    if (it == g.voice_states.end())
+        return;
+    const VoiceState &vs = it->second;
+    const Member *m = g.member(user_id);
+    User u;
+    if (m && m->user.id)
+        u = m->user;
+    else if (user_id == m_client.me().id)
+        u = m_client.me();
+    u.id = user_id;
+    std::string name = u.username.empty() && u.global_name.empty() ? std::string("...") : g.nameFor(u);
+    float cx = r.x + 8 + 18 + 11, cy = r.y + r.h / 2;
+    // A green ring around whoever is talking in our call.
+    bool talking = vs.channel_id == m_client.voiceCall().channel_id && speaking.count(user_id);
+    if (talking) {
+        m_r.fillCircle(cx, cy, 13, col::online);
+        m_r.fillCircle(cx, cy, 11.5f, col::bg_channels);
+    }
+    drawAvatar(cx, cy, 10, name, user_id, u.avatar.empty() ? std::string() : discord::cdn::avatarPath(u));
+    // State icons on the right: muted, deafened (red when a moderator did it), live.
+    float right = r.x + r.w - 6;
+    if (vs.deaf || vs.self_deaf) {
+        right -= 18;
+        drawIcon("headphone-off", {right, cy - 8, 16, 16}, vs.deaf ? col::danger : col::faint);
+    }
+    if (vs.mute || vs.self_mute || vs.suppress) {
+        right -= 18;
+        drawIcon("mic-off", {right, cy - 8, 16, 16}, vs.mute ? col::danger : col::faint);
+    }
+    if (vs.self_stream) {
+        Renderer::Bold b(m_r);
+        float w = m_r.measureText("LIVE", 10) + 8;
+        right -= w + 4;
+        m_r.fillRoundRect({right, cy - 8, w, 16}, 4, col::danger);
+        m_r.drawText(right + 4, cy - 6, "LIVE", 10, Color(255, 255, 255));
+    }
+    float x = cx + 18;
+    drawLabel(x, r.y + 8, name, 14, talking ? col::bright : col::muted, right - x - 6);
+}
+
+void App::drawVoicePanel(Rect area)
+{
+    m_r.fillRect(area, col::bg_panel);
+    m_r.fillRect({area.x + 10, area.y + area.h - 1, area.w - 20, 1}, col::bg_guilds);
+    voice::CallStatus st = m_client.voiceStatus();
+    const discord::VoiceCall &call = m_client.voiceCall();
+    std::string title = "Connecting...";
+    Color tc = col::warn;
+    if (st.state == voice::CallState::Connected) {
+        title = st.microphone ? "Voice Connected" : "Voice Connected (no mic)";
+        tc = col::online;
+    } else if (st.state == voice::CallState::Failed || st.state == voice::CallState::Ended) {
+        title = st.state == voice::CallState::Failed ? "Voice Failed" : "Disconnected";
+        tc = col::danger;
+    }
+    Rect d = panelButtonRect(PanelFocus::Disconnect);
+    float text_w = d.x - area.x - 22;
+    {
+        Renderer::Bold b(m_r);
+        m_r.drawText(area.x + 14, area.y + 11, m_r.ellipsize(title, 14, text_w), 14, tc);
+    }
+    std::string where;
+    if (st.state == voice::CallState::Failed && !st.detail.empty()) {
+        where = st.detail;
+    } else {
+        Guild *g = m_client.findGuild(call.guild_id);
+        Channel *c = m_client.findChannel(call.channel_id);
+        where = (c ? c->name : std::string("Voice")) + (g ? " / " + g->name : std::string());
+        if (st.encrypted)
+            where = "E2EE  " + where;
+    }
+    drawLabel(area.x + 14, area.y + 32, where, 12, col::muted, text_w);
+    drawPanelButton(PanelFocus::Disconnect, "phone-off", false);
+}
+
+float App::bottomPanelH() const
+{
+    return kUserPanelH + (m_client.inVoice() ? kVoicePanelH : 0);
+}
+
+Rect App::panelButtonRect(PanelFocus f) const
+{
+    float gx = kGuildBarW + kChannelW - 44, gy = Renderer::kHeight - kUserPanelH + 12;
+    switch (f) {
+    case PanelFocus::Mute: return {gx - 72, gy, 32, 32};
+    case PanelFocus::Deafen: return {gx - 36, gy, 32, 32};
+    case PanelFocus::Disconnect: return {gx, Renderer::kHeight - kUserPanelH - kVoicePanelH + 14, 32, 32};
+    case PanelFocus::Status: {
+        float x = kGuildBarW + 6;
+        return {x, Renderer::kHeight - kUserPanelH + 6, gx - 72 - 6 - x, kUserPanelH - 12};
+    }
+    default: return {gx, gy, 32, 32};
+    }
+}
+
+void App::activatePanel(PanelFocus f)
+{
+    const discord::VoiceCall &call = m_client.voiceCall();
+    switch (f) {
+    case PanelFocus::Disconnect: m_client.leaveVoice(); break;
+    case PanelFocus::Mute:
+        // Unmuting while deafened undeafens too, as on Discord.
+        if (call.muted || call.deafened) {
+            if (call.deafened)
+                m_client.setVoiceDeafened(false);
+            m_client.setVoiceMuted(false);
+        } else {
+            m_client.setVoiceMuted(true);
+        }
+        saveVoiceButtons();
+        break;
+    case PanelFocus::Deafen:
+        m_client.setVoiceDeafened(!call.deafened);
+        saveVoiceButtons();
+        break;
+    case PanelFocus::Gear: openSettings(); break;
+    case PanelFocus::Status: {
+        const std::string &p = m_client.presence();
+        m_statusMenuIndex = p == "idle" ? 1 : p == "dnd" ? 2 : p == "invisible" ? 3 : 0;
+        m_statusMenuOpen = true;
+        break;
+    }
+    default: break;
+    }
+}
+
+void App::saveVoiceButtons()
+{
+    // Kept for the next launch: muted stays muted.
+    const discord::VoiceCall &call = m_client.voiceCall();
+    if (m_settings.self_mute == call.muted && m_settings.self_deaf == call.deafened)
+        return;
+    m_settings.self_mute = call.muted;
+    m_settings.self_deaf = call.deafened;
+    if (!m_settings.save())
+        logf("app: couldn't save the mute and deafen buttons");
+}
+
+// --- Status menu -------------------------------------------------------------
+
+namespace {
+struct StatusChoice {
+    const char *id, *label, *detail;
+};
+constexpr StatusChoice kStatusChoices[] = {
+    {"online", "Online", nullptr},
+    {"idle", "Idle", nullptr},
+    {"dnd", "Do Not Disturb", "Silences your notifications"},
+    {"invisible", "Invisible", "You'll appear offline"},
+};
+constexpr float kStatusItemH = 48;
+}  // namespace
+
+Rect App::statusMenuRect() const
+{
+    float h = 4 * kStatusItemH + 12;
+    float x = kGuildBarW + 8, w = kChannelW - 16;
+    return {x, Renderer::kHeight - kUserPanelH - 6 - h, w, h};
+}
+
+Rect App::statusMenuItemRect(int i) const
+{
+    Rect r = statusMenuRect();
+    return {r.x + 6, r.y + 6 + i * kStatusItemH, r.w - 12, kStatusItemH};
+}
+
+void App::handleStatusMenuInput(u64 down)
+{
+    if (down & (HidNpadButton_B | HidNpadButton_X)) {
+        m_statusMenuOpen = false;
+        return;
+    }
+    if (down & HidNpadButton_AnyUp)
+        m_statusMenuIndex = std::max(0, m_statusMenuIndex - 1);
+    if (down & HidNpadButton_AnyDown)
+        m_statusMenuIndex = std::min(3, m_statusMenuIndex + 1);
+    if (down & HidNpadButton_A) {
+        m_statusMenuOpen = false;
+        chooseStatus(m_statusMenuIndex);
+    }
+}
+
+void App::chooseStatus(int i)
+{
+    if (i < 0 || i >= 4)
+        return;
+    std::string status = kStatusChoices[i].id;
+    if (status != m_client.presence())
+        m_client.setPresence(status, true);
+    if (m_settings.status != status) {
+        m_settings.status = status;
+        if (!m_settings.save())
+            logf("app: couldn't save the status");
+    }
+}
+
+void App::drawStatusDot(float cx, float cy, float r, const std::string &status, Color bg)
+{
+    Color c = status == "idle" ? col::warn : status == "dnd" ? col::danger : status == "invisible" ? col::faint : col::online;
+    m_r.fillShape({cx - r, cy - r, r * 2, r * 2}, Shape::Circle, c);
+    if (status == "offline")
+        c = col::faint;
+    if (status == "idle") {
+        // A crescent moon: a bite out of the top left.
+        float br = r * 0.62f, bx = cx - r * 0.42f, by = cy - r * 0.42f;
+        m_r.fillShape({bx - br, by - br, br * 2, br * 2}, Shape::Circle, bg);
+    } else if (status == "dnd") {
+        float w = r * 1.3f, h = std::max(2.0f, r * 0.45f);
+        m_r.fillRoundRect({cx - w / 2, cy - h / 2, w, h}, h / 2, bg);
+    } else if (status == "invisible" || status == "offline") {
+        float ir = r * 0.48f;
+        m_r.fillShape({cx - ir, cy - ir, ir * 2, ir * 2}, Shape::Circle, bg);
+    }
+}
+
+void App::drawStatusMenu()
+{
+    Rect r = statusMenuRect();
+    m_r.fillRoundRect({r.x - 1, r.y - 1, r.w + 2, r.h + 2}, 9, col::bg_guilds);
+    m_r.fillRoundRect(r, 8, col::bg_panel);
+    const std::string &current = m_client.presence();
+    for (int i = 0; i < 4; i++) {
+        const StatusChoice &s = kStatusChoices[i];
+        Rect it = statusMenuItemRect(i);
+        bool focus = m_mouseMode ? hovering(it) : i == m_statusMenuIndex;
+        Color bg = col::bg_panel;
+        if (focus && m_mouseMode) {
+            m_r.fillRoundRect(it, 6, col::hover);
+            bg = col::hover;
+        } else if (focus) {
+            drawFocusRing({it.x + 3, it.y + 3, it.w - 6, it.h - 6}, 6);
+        }
+        drawStatusDot(it.x + 22, it.y + it.h / 2, 7, s.id, bg);
+        float tx = it.x + 42, tw = it.w - 42 - 30;
+        bool picked = current == s.id;
+        if (s.detail) {
+            m_r.drawText(tx, it.y + 6, m_r.ellipsize(s.label, 15, tw), 15, col::bright);
+            m_r.drawText(tx, it.y + 26, m_r.ellipsize(s.detail, 12, tw), 12, col::muted);
+        } else {
+            m_r.drawText(tx, it.y + 14, m_r.ellipsize(s.label, 15, tw), 15, col::bright);
+        }
+        if (picked)
+            m_r.fillShape({it.x + it.w - 22, it.y + it.h / 2 - 4, 8, 8}, Shape::Circle, col::accent);
+    }
 }
 
 // --- Settings ----------------------------------------------------------------
@@ -3451,13 +4288,13 @@ Rect App::settingsListRect() const
 
 Rect App::settingsGearRect() const
 {
-    return {kGuildBarW + kChannelW - 44, Renderer::kHeight - kUserPanelH + 12, 32, 32};
+    return panelButtonRect(PanelFocus::Gear);
 }
 
 std::vector<App::SettingItem> App::settingItems() const
 {
     Rect c = settingsCardRect(), list = settingsListRect();
-    float x = c.x + 28, w = c.w - 56, y = list.y + 4 - m_settingsScroll;
+    float x = c.x + 28, w = c.w - 56, y = list.y + kFocusPad - m_settingsScroll;
     std::vector<SettingItem> out;
     auto row = [&](SettingRow r, float h = kSettingsRowH, int info = 0) {
         out.push_back({r, {x, y, w, h}, info});
@@ -3487,7 +4324,7 @@ std::vector<App::SettingItem> App::settingItems() const
         row(SettingRow::Videos, 72);
         break;
     case SettingPage::About:
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < kAboutRows; i++)
             row(SettingRow::Info, 48, i);
         break;
     }
@@ -3631,6 +4468,14 @@ void App::handleSettingsInput(u64 down)
         changeSetting(r, 1);
 }
 
+bool App::hasMessagesBack() const { return m_openChannel && (m_openForum || m_threadReturn); }
+
+Rect App::messagesBackRect() const
+{
+    float x = kGuildBarW + kChannelW;
+    return {x + 8, 4, 40, 40};
+}
+
 Rect App::settingsBackRect() const
 {
     Rect c = settingsCardRect();
@@ -3683,7 +4528,7 @@ void App::drawSettings()
     if (m_settingsScrollPending) {
         m_settingsScrollPending = false;
         const Rect &f = items[m_settingsIndex].rect;
-        float top = f.y + m_settingsScroll - list.y - 4, bottom = top + f.h + 12;
+        float top = f.y + m_settingsScroll - list.y - kFocusPad, bottom = top + f.h + kFocusPad + 4;
         if (top < m_settingsScroll)
             m_settingsScroll = top;
         if (bottom > m_settingsScroll + list.h)
@@ -3704,8 +4549,10 @@ void App::drawSettings()
         bool focus = m_mouseMode ? hovering(r) : (int)i == m_settingsIndex;
         if (it.row == SettingRow::LogOut) {
             bool armed = m_frameTime < m_logoutArmedUntil;
-            bool on = armed || focus;
+            bool on = armed || (focus && m_mouseMode);
             m_r.fillRoundRect(r, 8, on ? col::danger : col::bg_input);
+            if (focus && !m_mouseMode)
+                drawFocusRing(r, 8);
             const char *t = armed ? (m_mouseMode ? "Click again to log out" : "Press (A) again to log out") : "Log out";
             float tw = m_r.measureText(t, 17) + 30;
             drawIcon("settings/logout", {r.x + r.w / 2 - tw / 2, r.y + r.h / 2 - 11, 22, 22},
@@ -3715,18 +4562,21 @@ void App::drawSettings()
         }
         if (it.row == SettingRow::Info) {
             // About: label and value, read only.
-            const std::pair<const char *, const std::string *> rows[] = {
-                {"HOS version", &si.hos}, {"Platform", &si.platform}, {"App version", &si.app}, {"Environment", &si.environment}};
-            const auto &p = rows[std::clamp(it.info, 0, 3)];
-            m_r.fillRoundRect(r, 8, focus && !m_mouseMode ? col::selected : col::bg_input);
+            const std::pair<const char *, const std::string *> rows[kAboutRows] = {
+                {"App version", &si.app}, {"Build date", &si.build_date}, {"Commit", &si.commit},
+                {"HOS version", &si.hos}, {"Platform", &si.platform},     {"Environment", &si.environment}};
+            const auto &p = rows[std::clamp(it.info, 0, kAboutRows - 1)];
+            m_r.fillRoundRect(r, 8, col::bg_input);
+            if (focus && !m_mouseMode)
+                drawFocusRing(r, 8);
             m_r.drawText(r.x + 18, r.y + r.h / 2 - 10, p.first, 16, col::muted);
             float vw = m_r.measureText(*p.second, 16);
             m_r.drawText(r.x + r.w - 18 - vw, r.y + r.h / 2 - 10, *p.second, 16, col::text);
             continue;
         }
-        m_r.fillRoundRect(r, 8, focus ? col::selected : col::bg_input);
+        m_r.fillRoundRect(r, 8, focus && m_mouseMode ? col::selected : col::bg_input);
         if (focus && !m_mouseMode)
-            m_r.fillRoundRect({r.x, r.y + 8, 3, r.h - 16}, 1.5f, col::accent);
+            drawFocusRing(r, 8);
 
         const char *label = "", *icon = nullptr;
         std::string desc, value;
@@ -4203,6 +5053,23 @@ void App::rebuildLayout(float width)
     uint32_t version = m_client.messagesVersion();
     if (version == m_layoutVersion && m_layoutChannel == m_openChannel)
         return;
+    // Scrolled up: keep the message at the view's bottom edge where it is,
+    // so new messages (or anything else that changes height below it)
+    // don't push what you're reading up. The scroll is measured from the
+    // bottom, so it grows by however much the layout grew below the anchor.
+    Snowflake anchor_id = 0;
+    float anchor_off = 0;
+    if (m_layoutChannel == m_openChannel && m_msgScroll > 0 && !m_layout.empty()) {
+        float edge = m_layoutHeight - m_msgScroll;  // layout y at the view's bottom
+        for (size_t i = m_layout.size(); i-- > 0;) {
+            const MessageLayout &L = m_layout[i];
+            if (L.id && L.top <= edge) {
+                anchor_id = L.id;
+                anchor_off = edge - L.top;
+                break;
+            }
+        }
+    }
     m_layoutVersion = version;
     m_layoutChannel = m_openChannel;
     m_layout.clear();
@@ -4395,6 +5262,13 @@ void App::rebuildLayout(float width)
         m_layout.push_back(std::move(L));
     }
     m_layoutHeight += 12;
+    if (anchor_id) {
+        for (const MessageLayout &L : m_layout)
+            if (L.id == anchor_id) {
+                m_msgScroll = std::max(0.0f, m_layoutHeight - (L.top + anchor_off));
+                break;
+            }
+    }
 }
 
 void App::drawMessages(Rect area)
@@ -4427,6 +5301,15 @@ void App::drawMessages(Rect area)
     }
     std::string title = ch->label();
     float tx0 = area.x + 18;
+    if (hasMessagesBack()) {
+        // A forum post or thread: a back arrow to where it was opened from
+        // (B does the same on a controller).
+        Rect b = messagesBackRect();
+        if (hovering(b))
+            m_r.fillRoundRect(b, 8, col::hover);
+        drawIcon("arrow/back", {b.x + 8, b.y + 8, 24, 24}, hovering(b) ? col::bright : col::text);
+        tx0 = b.x + b.w + 6;
+    }
     Channel *thread_parent = ch->isThread() ? m_client.findChannel(ch->parent_id) : nullptr;
     if (thread_parent) {
         // "parent > thread", like Discord's header.
@@ -4516,10 +5399,6 @@ void App::drawMessages(Rect area)
         if (hovered && (int)li != sel)
             m_r.fillRect({view.x, y, view.w, L.height}, Color(0, 0, 0, 18));
         float cy = y;
-        if ((int)li == sel) {
-            m_r.fillRect({view.x, y, view.w, L.height}, col::overlay);
-            m_r.fillRect({view.x, y, 3, L.height}, col::accent);
-        }
         if (L.mentions_me) {
             m_r.fillRect({view.x, y, view.w, L.height}, Color(240, 177, 50, 20));
             m_r.fillRect({view.x, y, 2, L.height}, col::warn);
@@ -4533,13 +5412,15 @@ void App::drawMessages(Rect area)
                 cy += 20;
             }
             Rect av{view.x + kMsgAvatarX - kMsgAvatarR, cy + 19 - kMsgAvatarR, kMsgAvatarR * 2, kMsgAvatarR * 2};
-            if (partFocused(li, PartKind::Avatar) || hovering(av)) {
+            if (hovering(av) && !partFocused(li, PartKind::Avatar)) {
                 // An antialiased ring (fillCircle is a polygon with hard edges).
                 const float ring = kMsgAvatarR + 3;
                 float ax = view.x + kMsgAvatarX, ay = cy + 19;
                 m_r.fillShape({ax - ring, ay - ring, ring * 2, ring * 2}, Shape::Circle, col::bright);
             }
             drawAvatar(view.x + kMsgAvatarX, cy + 19, kMsgAvatarR, L.author, L.author_id, L.avatar);
+            if (partFocused(li, PartKind::Avatar))
+                drawFocusCircle(view.x + kMsgAvatarX, cy + 19, kMsgAvatarR);
             if (av.y + av.h > view.y && av.y < view.y + view.h)
                 m_avatarHits.push_back({av, li});
             float nw;
@@ -4640,7 +5521,7 @@ void App::drawMessages(Rect area)
                              size, hidden ? col::bright : col::faint);
             }
             if (partFocused(li, PartKind::Image, ii))
-                drawFocusRing(r);
+                drawFocusRing(r, 6);
             if (!img.video.empty() && !hidden) {
                 // A play button.
                 float cx = r.x + r.w / 2, cy2 = r.y + r.h / 2;
@@ -4657,10 +5538,9 @@ void App::drawMessages(Rect area)
         }
         if (L.thread_id) {
             Rect r{tx, cy + 3, std::min(420.0f, view.x + view.w - 24 - tx), kThreadBoxH};
-            bool on = hovering(r) || partFocused(li, PartKind::Thread);
-            m_r.fillRoundRect(r, 6, on ? col::selected : col::bg_panel);
+            m_r.fillRoundRect(r, 6, hovering(r) ? col::selected : col::bg_panel);
             if (partFocused(li, PartKind::Thread))
-                drawFocusRing(r);
+                drawFocusRing(r, 6);
             drawIcon("thread", {r.x + 12, r.y + r.h / 2 - 10, 20, 20}, col::muted);
             {
                 Renderer::Bold b(m_r);
@@ -4679,7 +5559,10 @@ void App::drawMessages(Rect area)
                 Rect r{tx + c.x, cy + c.row * (kChipH + kChipGap), c.w, kChipH};
                 if (r.y + r.h < view.y || r.y > view.y + view.h)
                     continue;
-                drawChip(r, c, partFocused(li, PartKind::Reaction, ci));
+                bool chip_focus = partFocused(li, PartKind::Reaction, ci);
+                drawChip(r, c, chip_focus);
+                if (chip_focus)
+                    drawFocusRing(r, 8);
                 float top = std::max(r.y, view.y), bottom = std::min(r.y + r.h, view.y + view.h);
                 m_reactionHits.push_back({{r.x, top, r.w, bottom - top}, li, ci});
             }
@@ -4690,15 +5573,24 @@ void App::drawMessages(Rect area)
             float bw = m_r.measureText(label, 13) + 24 + 20;
             Rect b{view.x + view.w - bw - 16, std::max(msg_top + 4, view.y + 4), bw, 26};
             if (b.y + b.h <= view.y + view.h) {
-                bool on = hovering(b) || partFocused(li, PartKind::Reply);
+                bool focused = partFocused(li, PartKind::Reply);
+                bool on = hovering(b) && !focused;  // the controller's focus is the outline
                 m_r.fillRoundRect({b.x - 1, b.y - 1, b.w + 2, b.h + 2}, 7, on ? col::bright : col::bg_guilds);
                 m_r.fillRoundRect(b, 6, on ? col::accent : col::bg_panel);
-                drawIcon("reply", {b.x + 10, b.y + 5, 16, 16}, on ? col::on_accent : col::muted);
-                m_r.drawText(b.x + 32, b.y + 5, label, 13, on ? col::on_accent : col::text);
+                drawIcon("reply", {b.x + 10, b.y + 5, 16, 16}, on ? col::on_accent : focused ? col::bright : col::muted);
+                m_r.drawText(b.x + 32, b.y + 5, label, 13, on ? col::on_accent : focused ? col::bright : col::text);
+                if (focused)
+                    drawFocusRing({b.x - 1, b.y - 1, b.w + 2, b.h + 2}, 7);
                 m_replyButton = b;
                 m_replyButtonLayout = (int)li;
             }
         }
+        // The highlighted message itself has the controller's focus: the
+        // same white outline as everything else (a part inside it, like
+        // the avatar or a picture, gets its own outline instead).
+        if ((int)li == sel && m_pane == Pane::Messages && !m_mouseMode && !m_composeFocus &&
+            m_selPart.kind == PartKind::None)
+            drawFocusRing({view.x + 10, msg_top + 5, view.w - 20, L.height - 10}, 8);
         y += L.height;
     }
     if (!cm.error.empty())
@@ -4723,10 +5615,10 @@ void App::drawMessages(Rect area)
         Renderer::Bold bold(m_r);
         drawLabel(b.x + 12 + w, b.y + 6, "@" + d->reply_name, 13, col::bright, b.w - w - 60);
         Rect x = cancelReplyRect();
-        if (hovering(x) || composeFocused(ComposeItem::CancelReply))
+        if (hovering(x))
             m_r.fillRoundRect(x, 5, col::hover);
         if (composeFocused(ComposeItem::CancelReply))
-            drawFocusRing({x.x + 2, x.y + 2, x.w - 4, x.h - 4});
+            drawFocusRing(x, 5);
         drawIcon("close", {x.x + x.w / 2 - 8, x.y + x.h / 2 - 8, 16, 16},
                  hovering(x) || composeFocused(ComposeItem::CancelReply) ? col::bright : col::muted);
     }
@@ -4736,7 +5628,7 @@ void App::drawMessages(Rect area)
     bool can_send = m_client.canSend(*ch);
     m_r.fillRoundRect(input, 8, col::bg_input);
     if (composeFocused(ComposeItem::Text))
-        drawFocusRing({input.x + 2, input.y + 2, input.w - 4, input.h - 4});
+        drawFocusRing(input, 8);
     uint64_t cooldown = can_send ? m_client.sendCooldownMs(*ch) : 0;
     Draft *dr = currentDraft();
     // Emoji show as :name: (the font has no emoji).
@@ -4752,9 +5644,9 @@ void App::drawMessages(Rect area)
         Rect a = attachButtonRect();
         float cx = a.x + a.w / 2, cy = a.y + a.h / 2;
         bool a_on = hovering(a) || composeFocused(ComposeItem::Attach);
-        if (composeFocused(ComposeItem::Attach))
-            m_r.fillShape({cx - 15, cy - 15, 30, 30}, Shape::Circle, col::accent);
         drawIcon("add", {cx - 12, cy - 12, 24, 24}, a_on ? col::bright : col::muted);
+        if (composeFocused(ComposeItem::Attach))
+            drawFocusCircle(cx, cy, 14);
         text_x = a.x + a.w + 8;
         if (dr && dr->has_image) {
             Rect t{input.x + 42, input.y + 5, 53, 30};
@@ -4766,9 +5658,11 @@ void App::drawMessages(Rect area)
                 drawIcon("play", {t.x + t.w / 2 - 8, t.y + t.h / 2 - 8, 16, 16}, Color(255, 255, 255, 230));
             Rect x = removeImageRect();
             float xc = x.x + x.w / 2, yc = x.y + x.h / 2;
-            bool x_on = hovering(x) || composeFocused(ComposeItem::RemoveImage);
+            bool x_on = hovering(x);
             m_r.fillShape({xc - 10, yc - 10, 20, 20}, Shape::Circle, x_on ? col::danger : col::selected);
             drawIcon("close", {xc - 6, yc - 6, 12, 12}, x_on ? col::on_accent : col::text);
+            if (composeFocused(ComposeItem::RemoveImage))
+                drawFocusCircle(xc, yc, 10);
             text_x = x.x + x.w + 10;
         }
     }
@@ -4800,7 +5694,7 @@ void App::drawMessages(Rect area)
         Rect e = emojiButtonRect();
         bool e_on = hovering(e) || composeFocused(ComposeItem::Emoji) || m_emojiOpen;
         if (composeFocused(ComposeItem::Emoji))
-            drawFocusRing({e.x + 2, e.y + 2, e.w - 4, e.h - 4});
+            drawFocusRing(e, 6);
         if (GLuint tex = m_images.get(kSmileUrl)) {
             float cx = e.x + e.w / 2, cy = e.y + e.h / 2;
             m_r.drawImage(tex, {cx - 11, cy - 11, 22, 22}, Shape::Rect,
@@ -4814,7 +5708,7 @@ void App::drawMessages(Rect area)
         if (ready)
             m_r.fillRoundRect(b, 6, bg);
         if (composeFocused(ComposeItem::Send))
-            drawFocusRing({b.x + 2, b.y + 2, b.w - 4, b.h - 4});
+            drawFocusRing(b, 6);
         float cx = b.x + b.w / 2, cy = b.y + b.h / 2;
         Color fg = ready ? col::on_accent : col::faint;
         drawIcon("send", {cx - 10, cy - 10, 20, 20}, fg);
@@ -4885,11 +5779,19 @@ void App::updateVideo()
     std::string data, error;
     if (m_videoFetch.take(data, error)) {
         logf("app: video downloaded (%zu bytes), opening", data.size());
-        if (error.empty() && !m_player.open(std::make_shared<MemorySource>(std::move(data)), error) && error.empty())
+        // In a voice call the call has the speaker: play without sound.
+        if (error.empty() && !m_player.open(std::make_shared<MemorySource>(std::move(data)), error, !m_client.inVoice()) &&
+            error.empty())
             error = "Couldn't play the video.";
         m_videoError = error;
         if (!error.empty())
             logf("app: video: %s", error.c_str());
+    }
+    if (m_client.inVoice() && m_player.hasSound()) {
+        // Joined a call while a video plays with sound: both can't use audout.
+        closeVideo();
+        toast("Video closed: the voice call is using the speaker.", false);
+        return;
     }
     m_player.update();
     if (m_videoError.empty() && m_player.isOpen()) {
@@ -5213,11 +6115,32 @@ void App::drawHints(Rect area)
         m_r.drawText(area.x + area.w - 18 - m_r.measureText(hints, 13), area.y + 7, hints, 13, col::faint);
         return;
     }
+    if (m_statusMenuOpen) {
+        hints = "(A) Set status   (Up/Down) Choose   (B) Close";
+        m_r.drawText(area.x + area.w - 18 - m_r.measureText(hints, 13), area.y + 7, hints, 13, col::faint);
+        return;
+    }
     switch (m_pane) {
-    case Pane::Guilds: hints = "(A) Open   (L/R) Server   (-) Settings   (+) Exit"; break;
+    case Pane::Guilds: hints = "(A) Open   (Right) Channel list   (L/R) Server   (-) Settings   (+) Exit"; break;
     case Pane::Channels:
-        hints = m_gearFocus ? "(A) Settings   (Up) Channels   (B) Back   (+) Exit"
-                            : "(A) Open   (B) Back   (L/R) Server   (-) Settings   (+) Exit";
+        switch (m_panelFocus) {
+        case PanelFocus::Disconnect: hints = "(A) Disconnect   (Up) Channels   (Down) Status   (B) Back"; break;
+        case PanelFocus::Status: hints = "(A) Set status   (Right) Mute   (Up) Channels   (B) Back   (L3) Mute"; break;
+        case PanelFocus::Mute:
+        case PanelFocus::Deafen:
+            hints = std::string(m_panelFocus == PanelFocus::Mute ? "(A) Mute" : "(A) Deafen") +
+                    "   (Left/Right) Buttons   (Up) Channels   (B) Back   (L3) Mute";
+            break;
+        case PanelFocus::Gear: hints = "(A) Settings   (Left) Deafen   (Up) Channels   (B) Back   (+) Exit"; break;
+        default:
+            if (!m_channelsEntered) {
+                hints = "(A) Choose a channel   (Down) Status, Mute, Deafen, Settings   (Left) Servers   (L/R) Server   (+) Exit";
+            } else {
+                bool voice_row = m_channelIndex >= 0 && (size_t)m_channelIndex < m_rows.size() && m_rows[m_channelIndex].voice;
+                hints = voice_row ? "(A) Join voice   (B) Done   (L/R) Server   (L3) Mute   (-) Settings   (+) Exit"
+                                  : "(A) Open   (B) Done   (L/R) Server   (-) Settings   (+) Exit";
+            }
+        }
         break;
     case Pane::Messages:
     {

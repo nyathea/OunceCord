@@ -171,6 +171,11 @@ void Guild::applyJson(const json::Value &v)
             channels.push_back(std::move(ch));
         }
     }
+    if (v.has("voice_states")) {
+        voice_states.clear();
+        for (const auto &s : v["voice_states"].items())
+            applyVoiceState(s);
+    }
     if (v.has("threads")) {
         for (const auto &c : v["threads"].items()) {
             Channel ch;
@@ -207,11 +212,56 @@ void Guild::setMember(const json::Value &m, Snowflake user_id)
         return;
     Member &mem = members[uid];
     mem.nick = m["nick"].str();
+    if (m.has("user") && m["user"].has("username"))
+        mem.user = User::fromJson(m["user"]);
     if (m.has("roles")) {
         mem.roles.clear();
         for (const auto &r : m["roles"].items())
             mem.roles.push_back(r.asId());
     }
+}
+
+VoiceState VoiceState::fromJson(const json::Value &v)
+{
+    VoiceState s;
+    s.user_id = v.has("user_id") ? v["user_id"].asId() : v["member"]["user"]["id"].asId();
+    s.channel_id = v["channel_id"].asId();
+    s.session_id = v["session_id"].str();
+    s.mute = v["mute"].asBool();
+    s.deaf = v["deaf"].asBool();
+    s.self_mute = v["self_mute"].asBool();
+    s.self_deaf = v["self_deaf"].asBool();
+    s.self_stream = v["self_stream"].asBool();
+    s.self_video = v["self_video"].asBool();
+    s.suppress = v["suppress"].asBool();
+    return s;
+}
+
+Snowflake Guild::applyVoiceState(const json::Value &v)
+{
+    VoiceState s = VoiceState::fromJson(v);
+    if (!s.user_id)
+        return 0;
+    if (v.has("member"))
+        setMember(v["member"], s.user_id);
+    auto it = voice_states.find(s.user_id);
+    Snowflake before = it == voice_states.end() ? 0 : it->second.channel_id;
+    if (!s.channel_id) {
+        if (it != voice_states.end())
+            voice_states.erase(it);
+    } else {
+        voice_states[s.user_id] = std::move(s);
+    }
+    return before;
+}
+
+std::vector<const VoiceState *> Guild::voiceIn(Snowflake channel_id) const
+{
+    std::vector<const VoiceState *> out;
+    for (const auto &[uid, s] : voice_states)
+        if (s.channel_id == channel_id)
+            out.push_back(&s);
+    return out;
 }
 
 const Member *Guild::member(Snowflake user_id) const

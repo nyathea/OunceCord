@@ -26,7 +26,9 @@ public:
     ~VideoPlayer();
 
     // Starts playing from the beginning. False (with a reason) if it can't.
-    bool open(std::shared_ptr<MediaSource> source, std::string &error);
+    // sound: false plays without audio (a voice call owns the speaker).
+    bool open(std::shared_ptr<MediaSource> source, std::string &error, bool sound = true);
+    bool hasSound() const { return m_audioOpen; }
     void close();
     bool isOpen() const { return m_open; }
 

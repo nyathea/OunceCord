@@ -18,6 +18,7 @@
 #include "discord/rest.h"
 #include "discord/types.h"
 #include "discord/upload.h"
+#include "voice/voice.h"
 
 namespace discord {
 
@@ -39,6 +40,27 @@ struct ForumPosts {
     bool has_more = false;
     int offset = 0;  // posts fetched so far
     std::string error;
+};
+
+// The voice channel we're in (or joining). channel_id 0: not in one.
+// Someone's status and what they're doing, from presence updates.
+struct Presence {
+    std::string status;    // "online", "idle", "dnd" or "offline"
+    std::string custom;    // custom status text (with its emoji)
+    std::string activity;  // "Playing Minecraft", "Listening to Spotify"...
+};
+
+struct VoiceCall {
+    Snowflake guild_id = 0;
+    Snowflake channel_id = 0;
+    bool muted = false;
+    bool deafened = false;
+    bool server_muted = false, server_deafened = false;  // by a moderator
+    // From VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE: the connection
+    // starts once all three are known.
+    std::string session_id, token, endpoint;
+    int rejoins = 0;         // times the voice session expired and was asked for again
+    bool rejoining = false;  // a leave-and-join is in flight
 };
 
 struct Typing {
@@ -73,6 +95,8 @@ public:
     // the paging state. loadForum fetches the first page once.
     ForumPosts &forum(Snowflake forum_id) { return m_forums[forum_id]; }
     void loadForum(Snowflake forum_id);
+    // Drops the cached posts and fetches the first page again.
+    void reloadForum(Snowflake forum_id);
     void loadMoreForum(Snowflake forum_id);
     // Makes sure a thread we only know by id (from a message) is in its
     // guild's channel list, and fetches its details.
@@ -81,8 +105,13 @@ public:
     ChannelMessages &messages(Snowflake channel_id) { return m_messages[channel_id]; }
     void loadMessages(Snowflake channel_id);  // latest page, if not loaded
     void loadOlder(Snowflake channel_id);
-    // Refetches the latest page; ignored while on cooldown.
-    void reloadMessages(Snowflake channel_id);
+    // Refetches the latest page; ignored while on cooldown unless forced.
+    void reloadMessages(Snowflake channel_id, bool force = false);
+    // Bumped on every READY or RESUMED, so the UI can refresh what it shows
+    // after a reconnect.
+    uint32_t connectionCount() const { return m_connectionCount; }
+    // Drops the gateway connection and resumes right away (after sleep).
+    void reconnectNow() { m_gateway.reconnectNow(); }
     // Milliseconds until slowmode lets us send in this channel (0 = now).
     uint64_t sendCooldownMs(const Channel &c);
     // Largest file we may upload in this channel (Nitro and server boosts).
@@ -98,11 +127,38 @@ public:
     // profile for guild_id. Fetched on first use, once per session: null
     // while loading; failed is set when it couldn't be loaded.
     const UserProfile *profile(Snowflake user_id, Snowflake guild_id, bool *failed = nullptr);
+    // Someone's presence, or null while unknown. When it isn't known it is
+    // asked for (through guild_id, else a server we share with them).
+    const Presence *presenceOf(Snowflake user_id, Snowflake guild_id, const UserProfile *profile = nullptr);
     // Whether we may send this server's emote in channel ch (null: anywhere):
     // without Nitro only the channel's own server's non-animated emotes;
     // role-locked and unavailable ones never.
     bool canUseEmoji(const Guild &source, const GuildEmoji &e, const Channel *ch);
     bool hasNitro() const { return m_me.premium_type != 0; }
+    // Voice channels. joinVoice asks the gateway to put us in the channel
+    // (leaving any other); the call connects once Discord answers.
+    bool canJoinVoice(const Channel &c);
+    void joinVoice(Snowflake channel_id);
+    void leaveVoice();
+    void setVoiceMuted(bool muted);
+    // Our status: "online", "idle", "dnd" or "invisible". Sent now when
+    // connected and on every connect after; sync also saves it to the
+    // account, so Discord's other apps show it too. Empty: the account's.
+    void setPresence(const std::string &status, bool sync);
+    const std::string &presence() const
+    {
+        static const std::string online = "online";
+        return !m_presence.empty() ? m_presence : !m_accountStatus.empty() ? m_accountStatus : online;
+    }
+    void setVoiceDeafened(bool deafened);
+    const VoiceCall &voiceCall() const { return m_call; }
+    bool inVoice() const { return m_call.channel_id != 0; }
+    voice::CallStatus voiceStatus() { return m_voice.status(); }
+    // Who is talking in our call (user ids), ourselves included.
+    std::set<Snowflake> voiceSpeaking();
+    // Bumped when anyone joins, leaves or changes state in a voice channel.
+    uint32_t voiceVersion() const { return m_voiceVersion; }
+
     // Marks a channel as being viewed: subscribes to its guild's events.
     void focusChannel(Snowflake channel_id);
     std::string typingText(Snowflake channel_id);
@@ -129,10 +185,14 @@ private:
     RestWorker m_rest;
     Gateway m_gateway;
     std::string m_token;
+    std::string m_sessionId;  // the main gateway's, from READY
 
     GatewayStatus m_status = GatewayStatus::Idle;
     std::string m_statusDetail;
     bool m_ready = false;
+    std::string m_presence;       // picked in the app
+    std::string m_accountStatus;  // the account's, from READY
+    uint32_t m_connectionCount = 0;
     User m_me;
     std::vector<Guild> m_guilds;
     std::vector<Channel> m_dms;
@@ -147,9 +207,16 @@ private:
         UserProfile profile;
     };
     std::map<std::pair<Snowflake, Snowflake>, ProfileEntry> m_profiles;  // (user, guild)
+    std::map<Snowflake, Presence> m_presences;
+    std::map<Snowflake, uint64_t> m_presenceAsked;  // user -> when we asked
+    void setPresenceFrom(const json::Value &p, Snowflake user_id = 0);
+    void readPresences(const json::Value &list);
     std::map<Snowflake, uint64_t> m_lastSent;  // channel -> time, for slowmode
     uint32_t m_structureVersion = 0;
     uint32_t m_messagesVersion = 0;
+    uint32_t m_voiceVersion = 0;
+    VoiceCall m_call;
+    voice::Connection m_voice;
 
     void post(std::function<void()> fn);
     void handleReady(const json::Value &d);
@@ -160,6 +227,10 @@ private:
     void sortDms();
     void fetchForumPage(Snowflake forum_id);
     void requestMembers(Snowflake channel_id);
+    void sendVoiceState();
+    void startVoiceIfReady();
+    void handleVoiceState(const json::Value &d);
+    void requestUsers(Guild &g, const std::vector<Snowflake> &users);
 };
 
 }  // namespace discord

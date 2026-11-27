@@ -15,18 +15,18 @@ enum : uint8_t {
 };
 
 bool WebSocket::connect(const std::string &host, const std::string &path,
-                        const HttpHeaders &headers, std::string *error)
+                        const HttpHeaders &headers, std::string *error, int port)
 {
     close();
     m_buf.clear();
     m_frag.clear();
     m_closeCode = 0;
-    if (!m_socket.connect(host, 443, error))
+    if (!m_socket.connect(host, port, error))
         return false;
 
     uint8_t key_bytes[16];
     randomBytes(key_bytes, sizeof(key_bytes));
-    std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host +
+    std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host + (port != 443 ? ":" + std::to_string(port) : std::string()) +
                       "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                       "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " +
                       base64Encode(key_bytes, sizeof(key_bytes)) + "\r\n";
@@ -89,6 +89,11 @@ bool WebSocket::sendFrame(uint8_t opcode, const void *data, size_t size)
 bool WebSocket::sendText(const std::string &text)
 {
     return sendFrame(Op_Text, text.data(), text.size());
+}
+
+bool WebSocket::sendBinary(const std::string &data)
+{
+    return sendFrame(Op_Binary, data.data(), data.size());
 }
 
 int WebSocket::parseFrame(uint8_t &opcode, bool &fin, std::string &payload)

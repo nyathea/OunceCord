@@ -43,16 +43,23 @@ public:
     // Queues a payload ({"op":..,"d":..}) to send. Thread-safe.
     void send(json::Value payload);
     void setToken(std::string token);
+    // The status sent when identifying ("online", "dnd"...). Thread-safe.
+    void setPresence(std::string status);
+    // Drops the current connection and resumes at once, skipping any backoff
+    // wait (after the console wakes from sleep, the old socket is stale).
+    void reconnectNow() { m_kick = true; }
 
 private:
     MainThreadPost m_post;
     GatewayListener *m_listener;
     std::thread m_thread;
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_kick{false};
 
     std::mutex m_mutex;
     std::deque<std::string> m_outbox;
     std::string m_token;
+    std::string m_presence;
 
     // Connection state, touched only by the gateway thread.
     WebSocket m_ws;
@@ -77,7 +84,8 @@ private:
     static constexpr size_t kMaxIdentifiesPerWindow = 12;
 
     void run();
-    void sleepFor(uint64_t ms);
+    // Returns early on stop(), and on reconnectNow() when kickable.
+    void sleepFor(uint64_t ms, bool kickable = false);
     // Sends if this connection's send budget allows; false otherwise.
     bool sendPayload(const std::string &text, bool priority);
     uint64_t identifyWaitMs();

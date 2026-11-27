@@ -48,6 +48,10 @@ public:
 
     void fillRect(Rect r, Color c);
     void fillRoundRect(Rect r, float radius, Color c);
+    // A focus outline that follows a shape exactly: the band from gap to
+    // gap + t outside r (a circle, squircle, or rectangle with corners of
+    // radius), shaded from b to a and back around it (a facing `phase`).
+    void drawOutline(Rect r, Shape shape, float radius, float gap, float t, Color a, Color b, float phase);
     void fillCircle(float cx, float cy, float radius, Color c);
     void fillTriangle(float x0, float y0, float x1, float y1, float x2, float y2, Color c);
 
@@ -118,6 +122,9 @@ private:
     GLuint m_program = 0, m_vao = 0, m_vbo = 0, m_atlasTex = 0;
     GLint m_uScreen = -1;
     GLuint m_imageProgram = 0;
+    GLuint m_outlineProgram = 0;
+    GLint m_uOlScreen = -1, m_uOlRect = -1, m_uOlShape = -1, m_uOlRadius = -1, m_uOlGap = -1, m_uOlThick = -1,
+          m_uOlCa = -1, m_uOlCb = -1, m_uOlPhase = -1;
     GLint m_uImgScreen = -1, m_uImgRect = -1, m_uImgShape = -1, m_uImgRadius = -1;
     GLuint m_whiteTex = 0;
     GLuint m_nv12Program = 0;

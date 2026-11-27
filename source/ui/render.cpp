@@ -4,6 +4,7 @@
 #include "util/sysinfo.h"
 
 #include <algorithm>
+#include <vector>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -49,6 +50,47 @@ static const char *const kFragmentSource =
 // The distance is converted to pixels so the edge is one pixel wide.
 // Uniforms shared with the vertex shader must match its precision (highp),
 // or the program fails to link.
+// A focus outline around a shape: drawn where the distance outside the
+// shape (same shapes as the image mask, distance in pixels) is between
+// u_gap and u_gap + u_thick, both edges antialiased. Its colour goes from
+// u_cb to u_ca and back around the centre, u_ca facing angle u_phase.
+static const char *const kOutlineFragmentSource =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_uv;\n"
+    "in vec4 v_color;\n"
+    "uniform vec4 u_rect;\n"
+    "uniform int u_shape;\n"
+    "uniform float u_radius;\n"
+    "uniform vec2 u_screen;\n"
+    "uniform float u_gap;\n"
+    "uniform float u_thick;\n"
+    "uniform vec4 u_ca;\n"
+    "uniform vec4 u_cb;\n"
+    "uniform float u_phase;\n"
+    "out vec4 o_color;\n"
+    "void main() {\n"
+    "    vec2 half_size = u_rect.zw * 0.5;\n"
+    "    vec2 frag = vec2(gl_FragCoord.x, u_screen.y - gl_FragCoord.y);\n"
+    "    vec2 rel = frag - (u_rect.xy + half_size);\n"
+    "    float d;\n"
+    "    if (u_shape == 2) {\n"
+    "        vec2 q = abs(rel) - half_size + vec2(u_radius);\n"
+    "        d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - u_radius;\n"
+    "    } else if (u_shape == 0) {\n"
+    "        d = length(rel) - min(half_size.x, half_size.y);\n"
+    "    } else {\n"
+    "        vec2 p = abs(rel) / half_size;\n"
+    "        vec2 q = p * p;\n"
+    "        d = (pow(q.x * q.x * p.x + q.y * q.y * p.y, 0.2) - 1.0) * min(half_size.x, half_size.y);\n"
+    "    }\n"
+    "    float a = clamp(d - u_gap + 0.5, 0.0, 1.0) * clamp(u_gap + u_thick - d + 0.5, 0.0, 1.0);\n"
+    "    float ang = atan(rel.y / max(u_rect.w, 1.0), rel.x / max(u_rect.z, 1.0));\n"
+    "    float f = 0.5 + 0.5 * cos(ang - u_phase);\n"
+    "    vec4 c = mix(u_cb, u_ca, f);\n"
+    "    o_color = vec4(c.rgb, c.a * a);\n"
+    "}\n";
+
 static const char *const kImageFragmentSource =
     "#version 300 es\n"
     "precision highp float;\n"
@@ -203,6 +245,19 @@ bool Renderer::init()
     m_uImgRect = glGetUniformLocation(m_imageProgram, "u_rect");
     m_uImgShape = glGetUniformLocation(m_imageProgram, "u_shape");
     m_uImgRadius = glGetUniformLocation(m_imageProgram, "u_radius");
+
+    vs = compileShader(GL_VERTEX_SHADER, kVertexSource);
+    fs = compileShader(GL_FRAGMENT_SHADER, kOutlineFragmentSource);
+    m_outlineProgram = linkProgram("outline", vs, fs);
+    m_uOlScreen = glGetUniformLocation(m_outlineProgram, "u_screen");
+    m_uOlRect = glGetUniformLocation(m_outlineProgram, "u_rect");
+    m_uOlShape = glGetUniformLocation(m_outlineProgram, "u_shape");
+    m_uOlRadius = glGetUniformLocation(m_outlineProgram, "u_radius");
+    m_uOlGap = glGetUniformLocation(m_outlineProgram, "u_gap");
+    m_uOlThick = glGetUniformLocation(m_outlineProgram, "u_thick");
+    m_uOlCa = glGetUniformLocation(m_outlineProgram, "u_ca");
+    m_uOlCb = glGetUniformLocation(m_outlineProgram, "u_cb");
+    m_uOlPhase = glGetUniformLocation(m_outlineProgram, "u_phase");
 
     vs = compileShader(GL_VERTEX_SHADER, kVertexSource);
     fs = compileShader(GL_FRAGMENT_SHADER, kNv12FragmentSource);
@@ -697,6 +752,30 @@ void Renderer::drawImage(GLuint tex, Rect r, Shape shape, Color tint)
     glUniform1f(m_uImgRadius, shape == Shape::Rect ? 0.0f : 6.0f * s);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
+    glBindVertexArray(m_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+    glBufferData(GL_ARRAY_BUFFER, m_verts.size() * sizeof(Vertex), m_verts.data(), GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)m_verts.size());
+    m_verts.clear();
+}
+
+void Renderer::drawOutline(Rect r, Shape shape, float radius, float gap, float t, Color ca, Color cb, float phase)
+{
+    flush();
+    float s = m_scale, pad = gap + t + 1;
+    pushQuad((r.x - pad) * s, (r.y - pad) * s, (r.x + r.w + pad) * s, (r.y + r.h + pad) * s, 0, 0, 1, 1,
+             Color(255, 255, 255));
+    glUseProgram(m_outlineProgram);
+    glUniform2f(m_uOlScreen, (float)m_surfaceW, (float)m_surfaceH);
+    glUniform4f(m_uOlRect, r.x * s, r.y * s, r.w * s, r.h * s);
+    glUniform1i(m_uOlShape, shape == Shape::Circle ? 0 : shape == Shape::Squircle ? 1 : 2);
+    float rad = shape == Shape::Rect ? 0.0f : std::min(radius, std::min(r.w, r.h) / 2);
+    glUniform1f(m_uOlRadius, rad * s);
+    glUniform1f(m_uOlGap, gap * s);
+    glUniform1f(m_uOlThick, t * s);
+    glUniform4f(m_uOlCa, ca.r / 255.0f, ca.g / 255.0f, ca.b / 255.0f, ca.a / 255.0f);
+    glUniform4f(m_uOlCb, cb.r / 255.0f, cb.g / 255.0f, cb.b / 255.0f, cb.a / 255.0f);
+    glUniform1f(m_uOlPhase, phase);
     glBindVertexArray(m_vao);
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
     glBufferData(GL_ARRAY_BUFFER, m_verts.size() * sizeof(Vertex), m_verts.data(), GL_STREAM_DRAW);

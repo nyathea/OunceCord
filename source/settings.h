@@ -18,6 +18,12 @@ struct Settings {
     bool videos = false;   // experimental: play videos in chat, send album clips
     bool clock24 = true;   // 24-hour times (else 12-hour with AM/PM)
     DateFormat date_format = DateFormat::YMD;
+    // Kept between launches: the status picked in the user panel ("online",
+    // "idle", "dnd", "invisible"; empty until one is picked, which keeps the
+    // account's own) and the mute and deafen buttons.
+    std::string status;
+    bool self_mute = false;
+    bool self_deaf = false;
 
     static const char *themeName(Theme t);  // "Dark", "Light", "AMOLED"
     static const char *dateFormatName(DateFormat f);  // "YYYY-MM-DD"...

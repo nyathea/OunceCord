@@ -45,6 +45,30 @@ void Client::update()
     }
     for (auto &fn : run)
         fn();
+    // The voice session expired: leave and join again for a new one.
+    if (m_voice.takeRejoin() && inVoice()) {
+        if (m_call.rejoins >= 3) {
+            logf("client: no voice server worked after 3 tries, giving up");
+            m_voice.stop();
+            leaveVoice();
+            if (onError)
+                onError("Lost the voice connection.");
+        } else {
+            m_call.rejoins++;
+            logf("client: rejoining voice (attempt %d)", m_call.rejoins);
+            m_voice.stop();
+            // The session id stays (it is the main gateway's); the new
+            // VOICE_SERVER_UPDATE's token and endpoint restart the call.
+            Snowflake channel = m_call.channel_id;
+            m_call.token.clear();
+            m_call.endpoint.clear();
+            m_call.rejoining = true;
+            m_call.channel_id = 0;
+            sendVoiceState();
+            m_call.channel_id = channel;
+            sendVoiceState();
+        }
+    }
 }
 
 void Client::start(const std::string &token)
@@ -65,6 +89,8 @@ void Client::start(const std::string &token)
 
 void Client::stop()
 {
+    m_voice.stop();
+    m_call = VoiceCall{};
     m_gateway.stop();
     m_rest.stop();
     std::lock_guard<std::mutex> lock(m_postMutex);
@@ -121,6 +147,16 @@ void Client::loadForum(Snowflake forum_id)
     if (f.loaded || f.loading)
         return;
     fetchForumPage(forum_id);
+}
+
+void Client::reloadForum(Snowflake forum_id)
+{
+    auto it = m_forums.find(forum_id);
+    if (it != m_forums.end() && it->second.loading)
+        return;
+    if (it != m_forums.end())
+        m_forums.erase(it);
+    loadForum(forum_id);
 }
 
 void Client::loadMoreForum(Snowflake forum_id)
@@ -236,6 +272,16 @@ void Client::sortDms()
 
 void Client::handleReady(const json::Value &d)
 {
+    // A new gateway session: Discord drops our voice state with the old one.
+    m_sessionId = d["session_id"].str();
+    if (inVoice()) {
+        m_voice.stop();
+        VoiceCall keep;
+        keep.muted = m_call.muted;
+        keep.deafened = m_call.deafened;
+        m_call = keep;
+    }
+    m_voiceVersion++;
     m_me = User::fromJson(d["user"]);
     m_guilds.clear();
     m_dms.clear();
@@ -271,11 +317,29 @@ void Client::handleReady(const json::Value &d)
             g.setMember(m);
         for (const auto &m : guilds[i]["members"].items())
             g.setMember(m);
+        // Names for the people in voice channels, from READY's users.
+        for (const auto &[uid, vs] : g.voice_states) {
+            Member &mem = g.members[uid];
+            if (!mem.user.id)
+                for (const auto &u : users)
+                    if (u.id == uid)
+                        mem.user = u;
+        }
         m_guilds.push_back(std::move(g));
     }
 
     // Order guilds as the user arranged them, when settings say so
     // (guild_folders in the JSON user settings); otherwise keep READY order.
+    m_accountStatus = d["user_settings"]["status"].str();
+    // Friends' (and some members') presences, in whichever shape READY has them.
+    m_presences.clear();
+    m_presenceAsked.clear();
+    readPresences(d["presences"]);
+    readPresences(d["merged_presences"]["friends"]);
+    for (const auto &list : d["merged_presences"]["guilds"].items())
+        readPresences(list);
+    for (const auto &g : d["guilds"].items())
+        readPresences(g["presences"]);
     const auto &folders = d["user_settings"]["guild_folders"];
     if (folders.isArray() && folders.size()) {
         std::vector<Snowflake> order;
@@ -435,6 +499,8 @@ void Client::handleMessageCreate(const json::Value &d)
 
 void Client::onDispatch(const std::string &type, const json::Value &d)
 {
+    if (type == "READY" || type == "RESUMED")
+        m_connectionCount++;
     if (type == "READY") {
         handleReady(d);
     } else if (type == "MESSAGE_CREATE") {
@@ -572,11 +638,36 @@ void Client::onDispatch(const std::string &type, const json::Value &d)
             m_structureVersion++;
             m_messagesVersion++;
         }
+    } else if (type == "VOICE_STATE_UPDATE") {
+        handleVoiceState(d);
+    } else if (type == "VOICE_SERVER_UPDATE") {
+        Snowflake gid = d["guild_id"].asId();
+        if (inVoice() && gid == m_call.guild_id) {
+            m_call.token = d["token"].str();
+            m_call.endpoint = d["endpoint"].str();  // null while the server is being reassigned
+            startVoiceIfReady();
+        }
+    } else if (type == "PRESENCE_UPDATE") {
+        setPresenceFrom(d);
     } else if (type == "GUILD_MEMBERS_CHUNK") {
+        if (d["presences"].isArray()) {
+            // Asked with presences: anyone without one is offline.
+            std::set<Snowflake> seen;
+            for (const auto &p : d["presences"].items()) {
+                setPresenceFrom(p);
+                seen.insert(p["user"]["id"].asId());
+            }
+            for (const auto &m : d["members"].items()) {
+                Snowflake uid = m["user"]["id"].asId();
+                if (uid && !seen.count(uid) && m_presenceAsked.count(uid))
+                    m_presences[uid] = Presence{"offline", {}, {}};
+            }
+        }
         if (Guild *g = findGuild(d["guild_id"].asId())) {
             for (const auto &m : d["members"].items())
                 g->setMember(m);
             m_messagesVersion++;
+            m_voiceVersion++;
         }
     } else if (type == "GUILD_MEMBER_ADD") {
         if (Guild *g = findGuild(d["guild_id"].asId())) {
@@ -837,6 +928,91 @@ const UserProfile *Client::profile(Snowflake user_id, Snowflake guild_id, bool *
     return nullptr;
 }
 
+void Client::readPresences(const json::Value &list)
+{
+    if (!list.isArray())
+        return;
+    for (const auto &p : list.items())
+        setPresenceFrom(p);
+}
+
+void Client::setPresenceFrom(const json::Value &p, Snowflake user_id)
+{
+    if (!user_id)
+        user_id = p["user"]["id"].asId();
+    if (!user_id)
+        user_id = p["user_id"].asId();
+    if (!user_id || !p["status"].isString())
+        return;
+    Presence out;
+    out.status = p["status"].str();
+    for (const auto &a : p["activities"].items()) {
+        int type = (int)a["type"].asInt();
+        if (type == 4) {
+            std::string emoji = a["emoji"]["id"].asId() ? std::string() : a["emoji"]["name"].str();
+            std::string text = a["state"].str();
+            out.custom = emoji.empty() ? text : text.empty() ? emoji : emoji + " " + text;
+            continue;
+        }
+        if (!out.activity.empty())
+            continue;
+        std::string name = a["name"].str();
+        if (name.empty())
+            continue;
+        switch (type) {
+        case 0: out.activity = "Playing " + name; break;
+        case 1: out.activity = "Streaming " + (a["details"].str().empty() ? name : a["details"].str()); break;
+        case 2: out.activity = "Listening to " + name; break;
+        case 3: out.activity = "Watching " + name; break;
+        case 5: out.activity = "Competing in " + name; break;
+        default: out.activity = name; break;
+        }
+    }
+    m_presences[user_id] = std::move(out);
+}
+
+const Presence *Client::presenceOf(Snowflake user_id, Snowflake guild_id, const UserProfile *profile)
+{
+    auto it = m_presences.find(user_id);
+    uint64_t now = nowMs();
+    auto asked = m_presenceAsked.find(user_id);
+    // Ask again after a while, so an open profile doesn't go stale.
+    bool fresh = asked != m_presenceAsked.end() && now - asked->second < 60000;
+    if (fresh || m_status != GatewayStatus::Connected)
+        return it == m_presences.end() ? nullptr : &it->second;
+    if (it != m_presences.end() && asked == m_presenceAsked.end())
+        return &it->second;  // from READY or an update, kept current by updates
+    // A server to ask through: the one we're in, else one we share.
+    Guild *g = guild_id ? findGuild(guild_id) : nullptr;
+    if (!g && profile)
+        for (Snowflake id : profile->mutual_guild_ids)
+            if ((g = findGuild(id)))
+                break;
+    if (!g)
+        for (auto &guild : m_guilds)
+            if (guild.member(user_id)) {
+                g = &guild;
+                break;
+            }
+    if (!g)
+        return it == m_presences.end() ? nullptr : &it->second;
+    m_presenceAsked[user_id] = now;
+    using json::Value;
+    Value ids = Value::array();
+    ids.push(Value::string(std::to_string(user_id)));
+    Value guild_ids = Value::array();
+    guild_ids.push(Value::string(std::to_string(g->id)));
+    Value d = Value::object();
+    d.set("guild_id", std::move(guild_ids));
+    d.set("user_ids", std::move(ids));
+    d.set("presences", Value::boolean(true));
+    Value payload = Value::object();
+    payload.set("op", Value::number((int64_t)8));
+    payload.set("d", std::move(d));
+    m_gateway.send(std::move(payload));
+    return it == m_presences.end() ? nullptr : &it->second;
+}
+
 void Client::sendMessage(Snowflake channel_id, const std::string &content, const Upload *upload,
                          Snowflake reply_to)
 {
@@ -1027,11 +1203,11 @@ void Client::requestMembers(Snowflake channel_id)
         logf("client: asked for %zu members of guild %llu", want.size(), (unsigned long long)g->id);
 }
 
-void Client::reloadMessages(Snowflake channel_id)
+void Client::reloadMessages(Snowflake channel_id, bool force)
 {
     ChannelMessages &cm = m_messages[channel_id];
     uint64_t now = nowMs();
-    if (cm.loading || now < cm.reload_at)
+    if (cm.loading || (!force && now < cm.reload_at))
         return;
     cm.reload_at = now + 3000;
     cm.loaded = false;
@@ -1065,6 +1241,228 @@ uint64_t Client::sendCooldownMs(const Channel &c)
     }
     uint64_t now = nowMs();
     return until > now ? until - now : 0;
+}
+
+// --- Voice ---------------------------------------------------------------------
+
+bool Client::canJoinVoice(const Channel &c)
+{
+    if (c.type != ChannelType_GuildVoice && c.type != ChannelType_GuildStageVoice)
+        return false;
+    Guild *g = findGuild(c.guild_id);
+    if (!g)
+        return false;
+    uint64_t p = g->permissionsIn(c, m_me.id);
+    return (p & perm::ViewChannel) && (p & perm::Connect);
+}
+
+void Client::sendVoiceState()
+{
+    using json::Value;
+    Value d = Value::object();
+    d.set("guild_id", m_call.guild_id ? Value::string(std::to_string(m_call.guild_id)) : Value());
+    d.set("channel_id", m_call.channel_id ? Value::string(std::to_string(m_call.channel_id)) : Value());
+    d.set("self_mute", Value::boolean(m_call.muted || m_call.deafened));
+    d.set("self_deaf", Value::boolean(m_call.deafened));
+    d.set("self_video", Value::boolean(false));
+    Value payload = Value::object();
+    payload.set("op", Value::number((int64_t)4));
+    payload.set("d", std::move(d));
+    m_gateway.send(std::move(payload));
+}
+
+void Client::joinVoice(Snowflake channel_id)
+{
+    Channel *c = findChannel(channel_id);
+    if (!c || !canJoinVoice(*c))
+        return;
+    if (m_call.channel_id == channel_id)
+        return;
+    // Joining moves us out of any other channel, on any server.
+    m_voice.stop();
+    m_call.guild_id = c->guild_id;
+    m_call.channel_id = channel_id;
+    m_call.session_id.clear();
+    m_call.token.clear();
+    m_call.endpoint.clear();
+    m_call.server_muted = m_call.server_deafened = false;
+    m_call.rejoins = 0;
+    m_call.rejoining = false;
+    logf("client: joining voice channel %llu", (unsigned long long)channel_id);
+    sendVoiceState();
+    m_voiceVersion++;
+}
+
+void Client::leaveVoice()
+{
+    if (!inVoice())
+        return;
+    m_voice.stop();
+    m_call.channel_id = 0;
+    sendVoiceState();
+    m_call.guild_id = 0;
+    m_call.session_id.clear();
+    m_call.token.clear();
+    m_call.endpoint.clear();
+    m_voiceVersion++;
+}
+
+void Client::setPresence(const std::string &status, bool sync)
+{
+    using json::Value;
+    m_presence = status;
+    m_gateway.setPresence(status);
+    if (status.empty())
+        return;
+    if (m_status == GatewayStatus::Connected) {
+        Value d = Value::object();
+        d.set("status", Value::string(status));
+        d.set("since", Value::number((int64_t)0));
+        d.set("activities", Value::array());
+        d.set("afk", Value::boolean(false));
+        Value payload = Value::object();
+        payload.set("op", Value::number((int64_t)3));
+        payload.set("d", std::move(d));
+        m_gateway.send(std::move(payload));
+    }
+    if (sync) {
+        Value body = Value::object();
+        body.set("status", Value::string(status));
+        m_rest.request("PATCH", "/users/@me/settings", body.dump(), [status](const HttpResponse &res) {
+            if (res.status != 200)
+                logf("client: saving status %s to the account failed (HTTP %d)", status.c_str(), res.status);
+        });
+    }
+    logf("client: status %s", status.c_str());
+}
+
+void Client::setVoiceMuted(bool muted)
+{
+    m_call.muted = muted;
+    // Unmuting while deafened undeafens too, as in Discord.
+    if (!muted)
+        m_call.deafened = false;
+    m_voice.setMuted(m_call.muted || m_call.server_muted);
+    m_voice.setDeafened(m_call.deafened || m_call.server_deafened);
+    if (inVoice())
+        sendVoiceState();
+    m_voiceVersion++;
+}
+
+void Client::setVoiceDeafened(bool deafened)
+{
+    m_call.deafened = deafened;
+    m_voice.setMuted(m_call.muted || m_call.deafened || m_call.server_muted);
+    m_voice.setDeafened(m_call.deafened || m_call.server_deafened);
+    if (inVoice())
+        sendVoiceState();
+    m_voiceVersion++;
+}
+
+void Client::startVoiceIfReady()
+{
+    if (!inVoice() || m_call.session_id.empty() || m_call.token.empty() || m_call.endpoint.empty())
+        return;
+    voice::JoinInfo info;
+    info.server_id = m_call.guild_id;
+    info.channel_id = m_call.channel_id;
+    info.user_id = m_me.id;
+    info.session_id = m_call.session_id;
+    info.token = m_call.token;
+    info.endpoint = m_call.endpoint;
+    m_voice.start(info, m_call.muted || m_call.deafened || m_call.server_muted,
+                  m_call.deafened || m_call.server_deafened);
+    // A token is good for one connection.
+    m_call.token.clear();
+}
+
+void Client::handleVoiceState(const json::Value &d)
+{
+    Snowflake gid = d["guild_id"].asId();
+    Guild *g = gid ? findGuild(gid) : nullptr;
+    if (!g)
+        return;  // DM calls aren't supported yet
+    Snowflake uid = d.has("user_id") ? d["user_id"].asId() : d["member"]["user"]["id"].asId();
+    g->applyVoiceState(d);
+    m_voiceVersion++;
+    if (uid && (!g->member(uid) || !g->member(uid)->user.id))
+        requestUsers(*g, {uid});
+    if (uid != m_me.id || !inVoice() || gid != m_call.guild_id)
+        return;
+    Snowflake ch = d["channel_id"].asId();
+    std::string session = d["session_id"].str();
+    if (!session.empty() && !m_sessionId.empty() && session != m_sessionId) {
+        // Our account on another device (the phone or PC app). If it joined
+        // voice, Discord moved the call there; its leaving doesn't affect us.
+        if (ch) {
+            logf("client: voice moved to another device");
+            m_voice.stop();
+            m_call.channel_id = 0;
+            m_call.guild_id = 0;
+            m_call.session_id.clear();
+            m_call.token.clear();
+            m_call.endpoint.clear();
+            if (onError)
+                onError("You joined voice on another device.");
+        }
+        return;
+    }
+    if (!ch && m_call.rejoining)
+        return;  // the leave half of a rejoin
+    m_call.rejoining = false;
+    if (!ch) {
+        // Kicked or disconnected (from here or another device).
+        logf("client: removed from the voice channel");
+        m_voice.stop();
+        m_call.channel_id = 0;
+        m_call.guild_id = 0;
+        return;
+    }
+    if (ch != m_call.channel_id) {
+        // Moved by a moderator: a new VOICE_SERVER_UPDATE follows.
+        m_voice.stop();
+        m_call.channel_id = ch;
+    }
+    m_call.server_muted = d["mute"].asBool() || d["suppress"].asBool();
+    m_call.server_deafened = d["deaf"].asBool();
+    m_voice.setMuted(m_call.muted || m_call.deafened || m_call.server_muted);
+    m_voice.setDeafened(m_call.deafened || m_call.server_deafened);
+    if (!session.empty() && session != m_call.session_id) {
+        m_call.session_id = session;
+        startVoiceIfReady();
+    }
+}
+
+std::set<Snowflake> Client::voiceSpeaking()
+{
+    std::set<Snowflake> out = m_voice.speaking();
+    if (m_voice.selfSpeaking())
+        out.insert(m_me.id);
+    return out;
+}
+
+void Client::requestUsers(Guild &g, const std::vector<Snowflake> &users)
+{
+    std::set<Snowflake> &asked = m_memberRequested[g.id];
+    using json::Value;
+    Value ids = Value::array();
+    for (Snowflake u : users)
+        if (u && !asked.count(u)) {
+            asked.insert(u);
+            ids.push(Value::string(std::to_string(u)));
+        }
+    if (!ids.size())
+        return;
+    Value guild_ids = Value::array();
+    guild_ids.push(Value::string(std::to_string(g.id)));
+    Value d = Value::object();
+    d.set("guild_id", std::move(guild_ids));
+    d.set("user_ids", std::move(ids));
+    d.set("presences", Value::boolean(false));
+    Value payload = Value::object();
+    payload.set("op", Value::number((int64_t)8));
+    payload.set("d", std::move(d));
+    m_gateway.send(std::move(payload));
 }
 
 }  // namespace discord
