@@ -11,9 +11,8 @@ WIP Discord Client for Switch 2 (KaiHEN)
 - Sending messages
 - Reactions under messages
 - Sending screenshots and video clips from the console's album
-- Playing videos in chat on the console's hardware video decoder.
-- Voice channels: see who is in them, join, talk, mute (also the left stick click) and deafen, with
-  Discord's end-to-end encryption (DAVE).
+- Playing videos in chat on the console's hardware video decoder
+- Voice support
 
 ## Building
 
@@ -49,8 +48,7 @@ Emoji names and categories come from GitHub's [gemoji](https://github.com/github
 
 Voice uses [libdave](https://github.com/discord/libdave) (MIT) for DAVE, with
 [MLS++](https://github.com/cisco/mlspp) (BSD-2-Clause), [nlohmann/json](https://github.com/nlohmann/json) (MIT) and [OpenSSL](https://www.openssl.org/) 3 (Apache 2.0),
-and [Opus](https://opus-codec.org/) (BSD-3-Clause) from devkitPro's portlibs. Parts of the voice code follow
-DiscordNX2's voice engine (MIT).
+and [Opus](https://opus-codec.org/) (BSD-3-Clause) from devkitPro's portlibs.
 
 Icons are from [Lucide](https://github.com/lucide-icons/lucide) (ISC), in the `third_party/lucide` submodule.
 The font is [Open Sans](https://github.com/googlefonts/opensans) (SIL Open Font License 1.1). Symbols and
@@ -58,5 +56,3 @@ The font is [Open Sans](https://github.com/googlefonts/opensans) (SIL Open Font 
 (Bitstream Vera license), [Noto Sans Math](https://github.com/notofonts/math) and
 [Noto Sans Symbols](https://github.com/notofonts/symbols) (both SIL Open Font License 1.1), in `font/fallback`
 with their licenses.
-
-Special Thanks to: [Paicord](https://github.com/llsc12/Paicord) which was used as a reference.
